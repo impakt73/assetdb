@@ -15,6 +15,7 @@ const VERSION: u32 = 2;
 const HEADER_LEN: u64 = 8;
 const HASH_LEN: u64 = 64; // lowercase hex-encoded SHA-256 content hash
 const RECORD_HEADER_LEN: u64 = 12 + HASH_LEN; // path_len u32 + data_len u64 + hex hash
+const TOMBSTONE_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// A virtual file system backed by a single database file on disk.
 ///
@@ -86,10 +87,7 @@ impl Vfs {
             .truncate(truncate)
             .open(path)
             .map_err(DbError::Io)?;
-        let mut end = file
-            .metadata()
-            .map_err(DbError::Io)?
-            .len();
+        let mut end = file.metadata().map_err(DbError::Io)?.len();
         let mut index = BTreeMap::new();
 
         if end == 0 {
@@ -109,7 +107,8 @@ impl Vfs {
             let mut header = [0u8; HEADER_LEN as usize];
             file.seek(SeekFrom::Start(0)).map_err(DbError::Io)?;
             file.read_exact(&mut header).map_err(DbError::Io)?;
-            if &header[0..4] != MAGIC || u32::from_le_bytes(header[4..8].try_into().unwrap()) != VERSION
+            if &header[0..4] != MAGIC
+                || u32::from_le_bytes(header[4..8].try_into().unwrap()) != VERSION
             {
                 return Err(DbError::InvalidFile(format!(
                     "{}: not a virtual file system database (bad header)",
@@ -128,8 +127,7 @@ impl Vfs {
                 let mut rec_header = [0u8; RECORD_HEADER_LEN as usize];
                 file.seek(SeekFrom::Start(pos)).map_err(DbError::Io)?;
                 file.read_exact(&mut rec_header).map_err(DbError::Io)?;
-                let path_len =
-                    u32::from_le_bytes(rec_header[0..4].try_into().unwrap()) as u64;
+                let path_len = u32::from_le_bytes(rec_header[0..4].try_into().unwrap()) as u64;
                 let data_len = u64::from_le_bytes(rec_header[4..12].try_into().unwrap());
                 let hash = match std::str::from_utf8(&rec_header[12..12 + HASH_LEN as usize]) {
                     Ok(hash) => hash.to_string(),
@@ -147,14 +145,18 @@ impl Vfs {
                     Ok(name) => name.to_string(),
                     Err(_) => break,
                 };
-                index.insert(
-                    name,
-                    Record {
-                        offset: data_offset,
-                        len: data_len,
-                        hash,
-                    },
-                );
+                if hash == TOMBSTONE_HASH && data_len == 0 {
+                    index.remove(&name);
+                } else {
+                    index.insert(
+                        name,
+                        Record {
+                            offset: data_offset,
+                            len: data_len,
+                            hash,
+                        },
+                    );
+                }
                 pos = data_offset + data_len;
             }
 
@@ -220,9 +222,36 @@ impl Vfs {
     /// The record is dropped from the index; its bytes remain in the
     /// database file until the file is rewritten.
     pub fn remove(&mut self, relative_path: &str) -> Option<Vec<u8>> {
-        let path = normalize_path(relative_path).ok()?;
-        let record = self.index.remove(&path)?;
-        self.read_data(&record).ok()
+        self.remove_persisted(relative_path).ok().flatten()
+    }
+
+    /// Remove a file and append a tombstone to persist the removal.
+    pub fn remove_persisted(&mut self, relative_path: &str) -> Result<Option<Vec<u8>>, DbError> {
+        let path = normalize_path(relative_path)?;
+        let Some(record) = self.index.remove(&path) else {
+            return Ok(None);
+        };
+        let data = self.read_data(&record)?;
+        if let Err(error) = self.append_tombstone(&path) {
+            self.index.insert(path, record);
+            return Err(error);
+        }
+        Ok(Some(data))
+    }
+
+    /// Rewrite the database, dropping payloads for removed or replaced files.
+    pub fn compact(&mut self) -> Result<(), DbError> {
+        let temporary = self.path.with_extension("db.tmp");
+        let _ = std::fs::remove_file(&temporary);
+        let mut replacement = Self::create(&temporary)?;
+        for (current_path, current_record) in &self.index {
+            replacement.insert(current_path, self.read_data(current_record)?)?;
+        }
+        replacement.flush()?;
+        drop(replacement);
+        std::fs::rename(&temporary, &self.path).map_err(DbError::Io)?;
+        *self = Self::open(&self.path)?;
+        Ok(())
     }
 
     /// Iterate over the normalized relative paths of all stored files.
@@ -247,7 +276,10 @@ impl Vfs {
 
     fn read_data(&self, record: &Record) -> Result<Vec<u8>, DbError> {
         let mut data = vec![0u8; record.len as usize];
-        let read = self.file.read_at(&mut data, record.offset).map_err(DbError::Io)?;
+        let read = self
+            .file
+            .read_at(&mut data, record.offset)
+            .map_err(DbError::Io)?;
         if read as u64 != record.len {
             return Err(DbError::InvalidFile(format!(
                 "{}: short read at offset {} ({} of {} bytes)",
@@ -264,9 +296,7 @@ impl Vfs {
         let hash = sha256::digest(data);
         let path_len = path.len() as u32;
         let data_offset = self.end + RECORD_HEADER_LEN + path.len() as u64;
-        let mut record = Vec::with_capacity(
-            RECORD_HEADER_LEN as usize + path.len() + data.len(),
-        );
+        let mut record = Vec::with_capacity(RECORD_HEADER_LEN as usize + path.len() + data.len());
         record.extend_from_slice(&path_len.to_le_bytes());
         record.extend_from_slice(&(data.len() as u64).to_le_bytes());
         record.extend_from_slice(hash.as_bytes());
@@ -294,6 +324,30 @@ impl Vfs {
                 hash,
             },
         );
+        Ok(())
+    }
+
+    fn append_tombstone(&mut self, path: &str) -> Result<(), DbError> {
+        let path_len = path.len() as u32;
+        let mut record = Vec::with_capacity(RECORD_HEADER_LEN as usize + path.len());
+        record.extend_from_slice(&path_len.to_le_bytes());
+        record.extend_from_slice(&0u64.to_le_bytes());
+        record.extend_from_slice(TOMBSTONE_HASH.as_bytes());
+        record.extend_from_slice(path.as_bytes());
+        let written = self.file.write_at(&record, self.end).map_err(DbError::Io)?;
+        if written != record.len() {
+            return Err(DbError::Io(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                format!(
+                    "{}: short write at offset {} ({} of {} bytes)",
+                    self.path.display(),
+                    self.end,
+                    written,
+                    record.len()
+                ),
+            )));
+        }
+        self.end += record.len() as u64;
         Ok(())
     }
 
@@ -538,17 +592,11 @@ mod tests {
         let file = tmp.db_file();
 
         std::fs::write(&file, b"not a vfs database").unwrap();
-        assert!(matches!(
-            Vfs::open(&file),
-            Err(DbError::InvalidFile(_))
-        ));
+        assert!(matches!(Vfs::open(&file), Err(DbError::InvalidFile(_))));
 
         // A file shorter than the header is invalid as well.
         std::fs::write(&file, b"AV").unwrap();
-        assert!(matches!(
-            Vfs::open(&file),
-            Err(DbError::InvalidFile(_))
-        ));
+        assert!(matches!(Vfs::open(&file), Err(DbError::InvalidFile(_))));
     }
 
     #[test]
@@ -604,9 +652,6 @@ mod tests {
     fn missing_parent_directory_is_an_io_error() {
         let tmp = TempDir::new();
         let missing = tmp.0.join("no/such/dir/vfs.db");
-        assert!(matches!(
-            Vfs::open(missing),
-            Err(DbError::Io(_))
-        ));
+        assert!(matches!(Vfs::open(missing), Err(DbError::Io(_))));
     }
 }

@@ -174,3 +174,31 @@ cargo clippy --all-targets
 ```
 
 Tests use unique per-process temp directories and clean up after themselves.
+
+## CLI
+
+The crate also builds an `asset-server` binary. Database roots are directories;
+the database file is created as `<root>/assets.db`.
+
+```sh
+asset-server create ./assets
+asset-server add ./assets models/cube.obj
+asset-server add ./assets source.bin stored/name.bin
+asset-server search ./assets cube
+asset-server dump ./assets models/cube.obj ./out/cube.obj
+asset-server dump ./assets ./out/all-assets
+asset-server remove ./assets models/cube.obj
+asset-server compact ./assets
+asset-server check ./assets
+```
+
+`add` imports a source file relative to the database root. Its optional third
+argument is the normalized path stored in the database. `search` matches asset
+paths and hexadecimal keys. `remove` and `dump` accept either a stored path or
+an asset key. Omitting the selector from `dump` exports every asset below the
+destination directory. `check` exits with status 2 when corruption is found
+and status 1 when the database cannot be opened or checked.
+
+`remove` records a deletion without rewriting the database. Use `compact` as a
+separate maintenance operation to reclaim space from removed and replaced
+assets.

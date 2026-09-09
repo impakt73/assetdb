@@ -2,7 +2,7 @@ pub mod db;
 pub mod vfs;
 
 pub use db::{Asset, AssetDatabase, AssetKey, DbError, IntegrityProblem, IntegrityReport};
-pub use vfs::{normalize_path, Vfs};
+pub use vfs::{Vfs, normalize_path};
 
 pub fn add(left: u64, right: u64) -> u64 {
     left + right
@@ -26,8 +26,7 @@ mod tests {
         static COUNTER: AtomicU32 = AtomicU32::new(100);
 
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir()
-            .join(format!("asset-server-e2e-{}-{n}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("asset-server-e2e-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let result: Result<(), DbError> = {
             std::fs::write(dir.join("icon.png"), b"\x89PNG").unwrap();

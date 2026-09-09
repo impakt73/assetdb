@@ -3,7 +3,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use crate::vfs::{normalize_path, Vfs};
+use crate::vfs::{Vfs, normalize_path};
 
 /// FNV-1a 64-bit hash, used to turn a relative asset path into a stable key.
 ///
@@ -318,6 +318,30 @@ impl AssetDatabase {
         self.vfs.contains(relative_path)
     }
 
+    /// Remove an asset and persist the removal in the database file.
+    pub fn remove_by_path(&mut self, relative_path: &str) -> Result<Option<Asset>, DbError> {
+        let path = normalize_path(relative_path)?;
+        let Some(asset) = self.get_by_path(&path) else {
+            return Ok(None);
+        };
+        self.vfs.remove_persisted(&path)?;
+        self.keys.remove(&asset.key);
+        Ok(Some(asset))
+    }
+
+    /// Remove an asset by its stable key and persist the removal.
+    pub fn remove(&mut self, key: AssetKey) -> Result<Option<Asset>, DbError> {
+        let Some(path) = self.keys.get(&key).cloned() else {
+            return Ok(None);
+        };
+        self.remove_by_path(&path)
+    }
+
+    /// Rewrite the database file, reclaiming space left by removed or replaced assets.
+    pub fn compact(&mut self) -> Result<(), DbError> {
+        self.vfs.compact()
+    }
+
     /// Iterate over the keys of all stored assets (sorted).
     pub fn keys(&self) -> impl Iterator<Item = AssetKey> {
         self.keys.keys().copied()
@@ -365,8 +389,8 @@ mod tests {
     impl TempDir {
         fn new() -> Self {
             let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let dir = std::env::temp_dir()
-                .join(format!("asset-server-test-{}-{n}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("asset-server-test-{}-{n}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             TempDir(dir)
         }
@@ -454,7 +478,10 @@ mod tests {
 
         assert_eq!(key1, key2);
         assert_eq!(db.len(), 1);
-        assert_eq!(db.get(key1).expect("record exists").data(), b"v2".as_slice());
+        assert_eq!(
+            db.get(key1).expect("record exists").data(),
+            b"v2".as_slice()
+        );
     }
 
     #[test]
@@ -483,6 +510,23 @@ mod tests {
         );
         assert_eq!(db.paths().count(), 2);
         assert_eq!(db.keys().count(), 2);
+    }
+
+    #[test]
+    fn removing_an_asset_persists_across_reopen() {
+        let tmp = TempDir::new();
+        let key = {
+            let mut db = AssetDatabase::new(&tmp.0).unwrap();
+            let key = db.import_from_memory("remove-me.txt", b"gone").unwrap();
+            db.import_from_memory("keep-me.txt", b"stay").unwrap();
+            assert_eq!(db.remove(key).unwrap().unwrap().data(), b"gone");
+            key
+        };
+
+        let db = AssetDatabase::new(&tmp.0).unwrap();
+        assert!(!db.contains_key(key));
+        assert!(!db.contains_path("remove-me.txt"));
+        assert_eq!(db.get_by_path("keep-me.txt").unwrap().data(), b"stay");
     }
 
     #[test]
@@ -534,9 +578,7 @@ mod tests {
         // The single database file on disk holds the imported payloads.
         let raw = std::fs::read(tmp.0.join("assets.db")).unwrap();
         assert!(raw.windows(b"png-bytes".len()).any(|w| w == b"png-bytes"));
-        assert!(raw
-            .windows(b"wave-data".len())
-            .any(|w| w == b"wave-data"));
+        assert!(raw.windows(b"wave-data".len()).any(|w| w == b"wave-data"));
         assert!(raw.windows(b"icon.png".len()).any(|w| w == b"icon.png"));
 
         // Reopening rebuilds the index from disk; data is read on demand.
@@ -553,9 +595,7 @@ mod tests {
         assert_eq!(db.key_for_path("icon.png"), Some(key));
         assert_eq!(db.get(key).unwrap().data(), b"png-bytes".as_slice());
         assert_eq!(
-            db.get_by_path("sound/a.wav")
-                .unwrap()
-                .data(),
+            db.get_by_path("sound/a.wav").unwrap().data(),
             b"wave-data".as_slice()
         );
     }
@@ -568,10 +608,7 @@ mod tests {
             db.import_from_memory("x.txt", b"v1").unwrap();
         }
         let mut db = AssetDatabase::new(&tmp.0).unwrap();
-        assert_eq!(
-            db.get_by_path("x.txt").unwrap().data(),
-            b"v1".as_slice()
-        );
+        assert_eq!(db.get_by_path("x.txt").unwrap().data(), b"v1".as_slice());
         let key = db.import_from_memory("x.txt", b"v2").unwrap();
         assert_eq!(key, AssetKey::from_path("x.txt"));
         assert_eq!(db.len(), 1);
@@ -665,7 +702,10 @@ mod tests {
         // Shrink the file out from under the open handle, leaving only 4
         // of the record's 16 data bytes:
         //   [header: 8][record header: 76][path: 5] = 89, + 4 data bytes.
-        let f = std::fs::OpenOptions::new().write(true).open(&db_file).unwrap();
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&db_file)
+            .unwrap();
         f.set_len(8 + 76 + 5 + 4).unwrap();
         drop(f);
 
@@ -682,7 +722,9 @@ mod tests {
     #[test]
     fn binary_asset_round_trips_through_file() {
         let tmp = TempDir::new();
-        let big: Vec<u8> = (0..256u16).flat_map(|i| [i as u8, (i >> 8) as u8]).collect();
+        let big: Vec<u8> = (0..256u16)
+            .flat_map(|i| [i as u8, (i >> 8) as u8])
+            .collect();
         let mut db = AssetDatabase::new(&tmp.0).unwrap();
         let key = db.import_from_memory("blob.bin", big.clone()).unwrap();
         assert_eq!(db.get(key).unwrap().data(), big.as_slice());
