@@ -1,34 +1,164 @@
 use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::fs::FileExt as _;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt as _;
 
 use crate::db::DbError;
 
-/// A minimal in-memory virtual file system.
+const MAGIC: &[u8; 4] = b"AVFS";
+const VERSION: u32 = 1;
+const HEADER_LEN: u64 = 8;
+const RECORD_HEADER_LEN: u64 = 12; // path_len u32 + data_len u64
+
+/// A virtual file system backed by a single database file on disk.
 ///
-/// Files are stored as raw bytes, keyed by their normalized path relative to
-/// a virtual root directory. It acts as the backing store for the
-/// [`AssetDatabase`](crate::AssetDatabase).
-#[derive(Debug, Clone)]
+/// All file contents live in one append-only log file; only a small
+/// in-memory index of `path -> (offset, length)` records is kept, so
+/// opening the file system never loads the stored data into memory.
+/// Data is read from disk on demand, one file at a time.
+///
+/// On-disk layout:
+///
+/// ```text
+/// [ "AVFS" ][ version u32 LE ]            (header)
+/// [ path_len u32 LE ][ data_len u64 LE ]  (record header)
+/// [ path bytes (UTF-8, normalized) ]
+/// [ data bytes ]
+/// ... more records, appended in insertion order
+/// ```
+///
+/// Re-inserting a path appends a new record; the index keeps the latest
+/// one. A truncated tail (e.g. from a crash mid-write) is discarded when
+/// the file is opened again.
+#[derive(Debug)]
 pub struct Vfs {
-    root: String,
-    files: BTreeMap<String, Vec<u8>>,
+    path: PathBuf,
+    file: File,
+    end: u64,
+    index: BTreeMap<String, Record>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Record {
+    /// Byte offset of the data payload within the database file.
+    offset: u64,
+    /// Length of the data payload.
+    len: u64,
 }
 
 impl Vfs {
-    /// Create a new empty virtual file system rooted at `root`.
-    pub fn new(root: impl Into<String>) -> Self {
-        Self {
-            root: root.into(),
-            files: BTreeMap::new(),
-        }
+    /// Open the database file at `path`, creating it (empty) if missing.
+    ///
+    /// Existing records are indexed, but their data is not read until
+    /// requested. Returns an error if the file exists but is not a valid
+    /// virtual file system database.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
+        Self::open_inner(path.as_ref(), false)
     }
 
-    /// The virtual root directory label.
-    pub fn root(&self) -> &str {
-        &self.root
+    /// Create a new, empty database file at `path`, discarding any
+    /// previous file that was there.
+    pub fn create(path: impl AsRef<Path>) -> Result<Self, DbError> {
+        Self::open_inner(path.as_ref(), true)
+    }
+
+    fn open_inner(path: &Path, truncate: bool) -> Result<Self, DbError> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(truncate)
+            .open(path)
+            .map_err(DbError::Io)?;
+        let mut end = file
+            .metadata()
+            .map_err(DbError::Io)?
+            .len();
+        let mut index = BTreeMap::new();
+
+        if end == 0 {
+            // Brand-new file: write the header.
+            let mut header = Vec::with_capacity(HEADER_LEN as usize);
+            header.extend_from_slice(MAGIC);
+            header.extend_from_slice(&VERSION.to_le_bytes());
+            file.write_all(&header).map_err(DbError::Io)?;
+            end = HEADER_LEN;
+        } else {
+            if end < HEADER_LEN {
+                return Err(DbError::InvalidFile(format!(
+                    "{}: too short to be a virtual file system database",
+                    path.display()
+                )));
+            }
+            let mut header = [0u8; HEADER_LEN as usize];
+            file.seek(SeekFrom::Start(0)).map_err(DbError::Io)?;
+            file.read_exact(&mut header).map_err(DbError::Io)?;
+            if &header[0..4] != MAGIC || u32::from_le_bytes(header[4..8].try_into().unwrap()) != VERSION
+            {
+                return Err(DbError::InvalidFile(format!(
+                    "{}: not a virtual file system database (bad header)",
+                    path.display()
+                )));
+            }
+
+            // Walk the log and index each record; keep the latest record
+            // per path. Stop at the first incomplete or malformed record.
+            let file_len = end;
+            let mut pos = HEADER_LEN;
+            while pos < file_len {
+                if file_len - pos < RECORD_HEADER_LEN {
+                    break;
+                }
+                let mut rec_header = [0u8; RECORD_HEADER_LEN as usize];
+                file.seek(SeekFrom::Start(pos)).map_err(DbError::Io)?;
+                file.read_exact(&mut rec_header).map_err(DbError::Io)?;
+                let path_len =
+                    u32::from_le_bytes(rec_header[0..4].try_into().unwrap()) as u64;
+                let data_len = u64::from_le_bytes(rec_header[4..12].try_into().unwrap());
+                let data_offset = pos + RECORD_HEADER_LEN + path_len;
+                if data_offset + data_len > file_len {
+                    break; // record runs past end of file: torn tail
+                }
+                let mut path_bytes = vec![0u8; path_len as usize];
+                file.seek(SeekFrom::Start(pos + RECORD_HEADER_LEN))
+                    .map_err(DbError::Io)?;
+                file.read_exact(&mut path_bytes).map_err(DbError::Io)?;
+                let name = match std::str::from_utf8(&path_bytes) {
+                    Ok(name) => name.to_string(),
+                    Err(_) => break,
+                };
+                index.insert(name, Record { offset: data_offset, len: data_len });
+                pos = data_offset + data_len;
+            }
+
+            if pos < file_len {
+                // Drop the torn tail so future appends overwrite it.
+                file.set_len(pos).map_err(DbError::Io)?;
+                end = pos;
+            }
+        }
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+            end,
+            index,
+        })
+    }
+
+    /// The path of the single database file backing this file system.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Insert (or replace) a file at `relative_path`.
     ///
+    /// The new content is appended to the database file immediately.
     /// Returns the previous content if a file already existed at that path.
     pub fn insert(
         &mut self,
@@ -36,48 +166,110 @@ impl Vfs {
         data: impl Into<Vec<u8>>,
     ) -> Result<Option<Vec<u8>>, DbError> {
         let path = normalize_path(relative_path)?;
-        Ok(self.files.insert(path, data.into()))
+        let data = data.into();
+        let previous = self
+            .index
+            .get(&path)
+            .map(|record| self.read_data(record))
+            .transpose()?;
+        self.append(&path, &data)?;
+        Ok(previous)
     }
 
     /// Look up a file by its (normalized) relative path.
-    pub fn get(&self, relative_path: &str) -> Option<&[u8]> {
-        self.files
-            .get(&normalize_path(relative_path).ok()?)
-            .map(Vec::as_slice)
+    ///
+    /// Only the requested file's data is read from the database file.
+    pub fn get(&self, relative_path: &str) -> Option<Vec<u8>> {
+        let path = normalize_path(relative_path).ok()?;
+        let record = self.index.get(&path)?;
+        self.read_data(record).ok()
     }
 
     /// Whether a file exists at the (normalized) relative path.
     pub fn contains(&self, relative_path: &str) -> bool {
         match normalize_path(relative_path) {
-            Ok(path) => self.files.contains_key(&path),
+            Ok(path) => self.index.contains_key(&path),
             Err(_) => false,
         }
     }
 
     /// Remove a file, returning its content if it existed.
+    ///
+    /// The record is dropped from the index; its bytes remain in the
+    /// database file until the file is rewritten.
     pub fn remove(&mut self, relative_path: &str) -> Option<Vec<u8>> {
-        self.files.remove(&normalize_path(relative_path).ok()?)
+        let path = normalize_path(relative_path).ok()?;
+        let record = self.index.remove(&path)?;
+        self.read_data(&record).ok()
     }
 
     /// Iterate over the normalized relative paths of all stored files.
     pub fn paths(&self) -> impl Iterator<Item = &str> {
-        self.files.keys().map(String::as_str)
+        self.index.keys().map(String::as_str)
     }
 
     /// Number of files stored.
     pub fn len(&self) -> usize {
-        self.files.len()
+        self.index.len()
     }
 
     /// Whether the virtual file system holds no files.
     pub fn is_empty(&self) -> bool {
-        self.files.is_empty()
+        self.index.is_empty()
     }
-}
 
-impl Default for Vfs {
-    fn default() -> Self {
-        Self::new(String::new())
+    /// Flush pending writes to disk.
+    pub fn flush(&self) -> Result<(), DbError> {
+        self.file.sync_data().map_err(DbError::Io)
+    }
+
+    fn read_data(&self, record: &Record) -> Result<Vec<u8>, DbError> {
+        let mut data = vec![0u8; record.len as usize];
+        let read = self.file.read_at(&mut data, record.offset).map_err(DbError::Io)?;
+        if read as u64 != record.len {
+            return Err(DbError::InvalidFile(format!(
+                "{}: short read at offset {} ({} of {} bytes)",
+                self.path.display(),
+                record.offset,
+                read,
+                record.len
+            )));
+        }
+        Ok(data)
+    }
+
+    fn append(&mut self, path: &str, data: &[u8]) -> Result<(), DbError> {
+        let path_len = path.len() as u32;
+        let data_offset = self.end + RECORD_HEADER_LEN + path.len() as u64;
+        let mut record = Vec::with_capacity(
+            RECORD_HEADER_LEN as usize + path.len() + data.len(),
+        );
+        record.extend_from_slice(&path_len.to_le_bytes());
+        record.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        record.extend_from_slice(path.as_bytes());
+        record.extend_from_slice(data);
+        let written = self.file.write_at(&record, self.end).map_err(DbError::Io)?;
+        if written as u64 != record.len() as u64 {
+            return Err(DbError::Io(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                format!(
+                    "{}: short write at offset {} ({} of {} bytes)",
+                    self.path.display(),
+                    self.end,
+                    written,
+                    record.len()
+                ),
+            )));
+        }
+        self.end += record.len() as u64;
+        self.index.insert(
+            path.to_string(),
+            Record {
+                offset: data_offset,
+                len: data.len() as u64,
+            },
+        );
+        Ok(())
     }
 }
 
@@ -105,6 +297,32 @@ pub fn normalize_path(path: &str) -> Result<String, DbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static TEMP_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// Unique temp directory removed on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("asset-server-vfs-test-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+
+        fn db_file(&self) -> PathBuf {
+            self.0.join("vfs.db")
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn normalizes_paths() {
@@ -147,15 +365,16 @@ mod tests {
 
     #[test]
     fn stores_reads_and_removes_files() {
-        let mut vfs = Vfs::new("assets");
+        let tmp = TempDir::new();
+        let mut vfs = Vfs::open(tmp.db_file()).unwrap();
         assert!(vfs.is_empty());
         assert_eq!(vfs.len(), 0);
 
         vfs.insert("a/b.txt", b"hello").unwrap();
         assert_eq!(vfs.len(), 1);
-        assert_eq!(vfs.get("a/b.txt"), Some(b"hello".as_slice()));
+        assert_eq!(vfs.get("a/b.txt"), Some(b"hello".to_vec()));
         // Lookup normalizes the requested path too.
-        assert_eq!(vfs.get("./a/b.txt"), Some(b"hello".as_slice()));
+        assert_eq!(vfs.get("./a/b.txt"), Some(b"hello".to_vec()));
         assert!(vfs.contains("a/b.txt"));
         assert!(!vfs.contains("missing.txt"));
         assert!(vfs.get("missing.txt").is_none());
@@ -164,7 +383,7 @@ mod tests {
         let previous = vfs.insert("a/b.txt", b"world").unwrap();
         assert_eq!(previous, Some(b"hello".to_vec()));
         assert_eq!(vfs.len(), 1);
-        assert_eq!(vfs.get("a/b.txt"), Some(b"world".as_slice()));
+        assert_eq!(vfs.get("a/b.txt"), Some(b"world".to_vec()));
 
         assert_eq!(vfs.remove("a/b.txt"), Some(b"world".to_vec()));
         assert!(vfs.is_empty());
@@ -173,10 +392,140 @@ mod tests {
 
     #[test]
     fn lists_paths() {
-        let mut vfs = Vfs::new("assets");
+        let tmp = TempDir::new();
+        let mut vfs = Vfs::open(tmp.db_file()).unwrap();
         vfs.insert("b/b.bin", b"2").unwrap();
         vfs.insert("a/a.bin", b"1").unwrap();
         let paths: Vec<&str> = vfs.paths().collect();
         assert_eq!(paths, vec!["a/a.bin", "b/b.bin"]);
+    }
+
+    #[test]
+    fn data_persists_across_reopen() {
+        let tmp = TempDir::new();
+        let file = tmp.db_file();
+        {
+            let mut vfs = Vfs::open(&file).unwrap();
+            vfs.insert("a.bin", b"alpha").unwrap();
+            vfs.insert("b/c.bin", b"beta-beta").unwrap();
+        }
+
+        // Reopening rebuilds the index from the file on disk.
+        let vfs = Vfs::open(&file).unwrap();
+        assert_eq!(vfs.len(), 2);
+        assert!(vfs.contains("a.bin"));
+        assert!(vfs.contains("b/c.bin"));
+        assert_eq!(vfs.get("a.bin"), Some(b"alpha".to_vec()));
+        assert_eq!(vfs.get("b/c.bin"), Some(b"beta-beta".to_vec()));
+        let paths: Vec<&str> = vfs.paths().collect();
+        assert_eq!(paths, vec!["a.bin", "b/c.bin"]);
+    }
+
+    #[test]
+    fn reimport_after_reopen_keeps_latest_version() {
+        let tmp = TempDir::new();
+        let file = tmp.db_file();
+        {
+            let mut vfs = Vfs::open(&file).unwrap();
+            vfs.insert("x.bin", b"v1").unwrap();
+        }
+        let mut vfs = Vfs::open(&file).unwrap();
+        assert_eq!(vfs.get("x.bin"), Some(b"v1".to_vec()));
+        let previous = vfs.insert("x.bin", b"v2").unwrap();
+        assert_eq!(previous, Some(b"v1".to_vec()));
+        assert_eq!(vfs.len(), 1);
+        assert_eq!(vfs.get("x.bin"), Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    fn create_discards_previous_file() {
+        let tmp = TempDir::new();
+        let file = tmp.db_file();
+        {
+            let mut vfs = Vfs::open(&file).unwrap();
+            vfs.insert("a.bin", b"old").unwrap();
+        }
+        let mut vfs = Vfs::create(&file).unwrap();
+        assert!(vfs.is_empty());
+        vfs.insert("a.bin", b"new").unwrap();
+        assert_eq!(vfs.get("a.bin"), Some(b"new".to_vec()));
+    }
+
+    #[test]
+    fn rejects_files_that_are_not_databases() {
+        let tmp = TempDir::new();
+        let file = tmp.db_file();
+
+        std::fs::write(&file, b"not a vfs database").unwrap();
+        assert!(matches!(
+            Vfs::open(&file),
+            Err(DbError::InvalidFile(_))
+        ));
+
+        // A file shorter than the header is invalid as well.
+        std::fs::write(&file, b"AV").unwrap();
+        assert!(matches!(
+            Vfs::open(&file),
+            Err(DbError::InvalidFile(_))
+        ));
+    }
+
+    #[test]
+    fn recovers_from_torn_tail() {
+        let tmp = TempDir::new();
+        let file = tmp.db_file();
+        {
+            let mut vfs = Vfs::open(&file).unwrap();
+            vfs.insert("ok.bin", b"good-data").unwrap();
+        }
+        // Simulate a crash mid-write: a partial record after the last good one.
+        let mut f = OpenOptions::new().append(true).open(&file).unwrap();
+        f.write_all(b"\x02\x00\x00\x00").unwrap();
+        drop(f);
+
+        let vfs = Vfs::open(&file).unwrap();
+        assert_eq!(vfs.len(), 1);
+        assert_eq!(vfs.get("ok.bin"), Some(b"good-data".to_vec()));
+        // Appending after recovery still works.
+        drop(vfs);
+        let mut vfs = Vfs::open(&file).unwrap();
+        vfs.insert("more.bin", b"more").unwrap();
+        assert_eq!(vfs.len(), 2);
+    }
+
+    #[test]
+    fn external_truncation_surfaces_as_invalid_file() {
+        let tmp = TempDir::new();
+        let file = tmp.db_file();
+        let mut vfs = Vfs::open(&file).unwrap();
+        vfs.insert("a.bin", b"0123456789abcdef").unwrap();
+
+        // Shrink the file out from under the open handle, as another
+        // process writing to it could.
+        let f = OpenOptions::new().write(true).open(&file).unwrap();
+        f.set_len(HEADER_LEN + RECORD_HEADER_LEN + 5).unwrap();
+        drop(f);
+
+        // Reading the truncated record is an error, not zero-padded garbage.
+        assert!(vfs.get("a.bin").is_none());
+        assert!(matches!(
+            vfs.insert("a.bin", b"new"),
+            Err(DbError::InvalidFile(_))
+        ));
+
+        // A fresh open discards the torn record.
+        drop(vfs);
+        let vfs = Vfs::open(&file).unwrap();
+        assert!(vfs.is_empty());
+    }
+
+    #[test]
+    fn missing_parent_directory_is_an_io_error() {
+        let tmp = TempDir::new();
+        let missing = tmp.0.join("no/such/dir/vfs.db");
+        assert!(matches!(
+            Vfs::open(missing),
+            Err(DbError::Io(_))
+        ));
     }
 }

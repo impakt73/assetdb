@@ -32,7 +32,7 @@ mod tests {
         let result: Result<(), DbError> = {
             std::fs::write(dir.join("icon.png"), b"\x89PNG").unwrap();
 
-            let mut db = AssetDatabase::new(&dir);
+            let mut db = AssetDatabase::new(&dir).unwrap();
             let disk_key = db.import_from_disk("icon.png").unwrap();
             let mem_key = db.import_from_memory("note.txt", b"hello").unwrap();
 

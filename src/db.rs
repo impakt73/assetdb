@@ -78,6 +78,9 @@ pub enum DbError {
     InvalidKey(String),
     /// A disk import failed to read the file.
     Io(std::io::Error),
+    /// The on-disk database file was missing, corrupt, or not a valid
+    /// database file.
+    InvalidFile(String),
 }
 
 impl fmt::Display for DbError {
@@ -85,7 +88,8 @@ impl fmt::Display for DbError {
         match self {
             Self::InvalidPath(path) => write!(f, "invalid asset path: {path:?}"),
             Self::InvalidKey(key) => write!(f, "invalid asset key: {key:?}"),
-            Self::Io(err) => write!(f, "io error while importing asset: {err}"),
+            Self::Io(err) => write!(f, "io error: {err}"),
+            Self::InvalidFile(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -120,13 +124,20 @@ impl Asset {
     }
 }
 
+/// Name of the single database file that stores all asset data, kept
+/// inside the root asset directory.
+pub const DB_FILE_NAME: &str = "assets.db";
+
 /// A simple asset database.
 ///
-/// Assets live in an in-memory virtual file system. Each asset's database
-/// key is the FNV-1a 64-bit hash of its path relative to the root asset
-/// directory, which keeps assets unique and lets them be looked up either
-/// by key or by relative path.
-#[derive(Debug, Clone)]
+/// All asset data is stored in a single database file on disk
+/// (`assets.db` inside the root asset directory). Only lightweight
+/// per-asset index entries (key, path, and file offset) are kept in
+/// memory, so opening a database never loads its assets into memory at
+/// once. Each asset's database key is the FNV-1a 64-bit hash of its path
+/// relative to the root asset directory, which keeps assets unique and
+/// lets them be looked up either by key or by relative path.
+#[derive(Debug)]
 pub struct AssetDatabase {
     root: PathBuf,
     vfs: Vfs,
@@ -134,23 +145,30 @@ pub struct AssetDatabase {
 }
 
 impl AssetDatabase {
-    /// Create a new, empty database rooted at `root`.
+    /// Open the database rooted at `root`, creating it if missing.
     ///
     /// The root asset directory is where `import_from_disk` resolves
-    /// relative paths against.
-    pub fn new(root: impl Into<PathBuf>) -> Self {
+    /// relative paths against. Asset data is stored in the single file
+    /// `root/assets.db`; any records already present in that file are
+    /// indexed and become available.
+    pub fn new(root: impl Into<PathBuf>) -> Result<Self, DbError> {
         let root = root.into();
-        let vfs = Vfs::new(root.display().to_string());
-        Self {
-            root,
-            vfs,
-            keys: BTreeMap::new(),
-        }
+        let vfs = Vfs::open(root.join(DB_FILE_NAME))?;
+        let keys: BTreeMap<AssetKey, String> = vfs
+            .paths()
+            .map(|path| (AssetKey::from_path(path), path.to_string()))
+            .collect();
+        Ok(Self { root, vfs, keys })
     }
 
     /// The root asset directory.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The single database file holding all asset data.
+    pub fn db_file(&self) -> &Path {
+        self.vfs.path()
     }
 
     /// The virtual file system backing this database.
@@ -192,9 +210,11 @@ impl AssetDatabase {
     }
 
     /// Look up an asset record by key.
+    ///
+    /// The asset's data is read from the database file on demand.
     pub fn get(&self, key: AssetKey) -> Option<Asset> {
         let path = self.keys.get(&key)?;
-        let data = self.vfs.get(path)?.to_vec();
+        let data = self.vfs.get(path)?;
         Some(Asset {
             key,
             path: path.clone(),
@@ -203,10 +223,12 @@ impl AssetDatabase {
     }
 
     /// Look up an asset record by (normalized) relative path.
+    ///
+    /// The asset's data is read from the database file on demand.
     pub fn get_by_path(&self, relative_path: &str) -> Option<Asset> {
         let path = normalize_path(relative_path).ok()?;
         let key = AssetKey(fnv1a64(path.as_bytes()));
-        let data = self.vfs.get(&path)?.to_vec();
+        let data = self.vfs.get(&path)?;
         Some(Asset { key, path, data })
     }
 
@@ -302,7 +324,8 @@ mod tests {
 
     #[test]
     fn import_from_memory_and_lookup_by_key_and_path() {
-        let mut db = AssetDatabase::new("/root/assets");
+        let tmp = TempDir::new();
+        let mut db = AssetDatabase::new(&tmp.0).unwrap();
         let data: &[u8] = b"PNG-bytes-here";
         let key = db.import_from_memory("textures/sky.png", data).unwrap();
 
@@ -339,7 +362,8 @@ mod tests {
 
     #[test]
     fn reimporting_same_path_keeps_one_unique_record() {
-        let mut db = AssetDatabase::new("/root/assets");
+        let tmp = TempDir::new();
+        let mut db = AssetDatabase::new(&tmp.0).unwrap();
         let key1 = db.import_from_memory("a.txt", b"v1").unwrap();
         let key2 = db.import_from_memory("a.txt", b"v2").unwrap();
 
@@ -355,7 +379,7 @@ mod tests {
         std::fs::write(tmp.0.join("models/cube.obj"), b"v 0 0 0").unwrap();
         std::fs::write(tmp.0.join("shaders.glsl"), b"void main(){}").unwrap();
 
-        let mut db = AssetDatabase::new(&tmp.0);
+        let mut db = AssetDatabase::new(&tmp.0).unwrap();
         let key = db.import_from_disk("models/cube.obj").unwrap();
         assert_eq!(key, AssetKey::from_path("models/cube.obj"));
 
@@ -379,7 +403,7 @@ mod tests {
     #[test]
     fn disk_import_errors() {
         let tmp = TempDir::new();
-        let mut db = AssetDatabase::new(&tmp.0);
+        let mut db = AssetDatabase::new(&tmp.0).unwrap();
         assert!(matches!(
             db.import_from_disk("missing.bin"),
             Err(DbError::Io(_))
@@ -398,12 +422,97 @@ mod tests {
 
     #[test]
     fn lists_all_assets() {
-        let mut db = AssetDatabase::new("/root/assets");
+        let tmp = TempDir::new();
+        let mut db = AssetDatabase::new(&tmp.0).unwrap();
         db.import_from_memory("b/b.bin", b"2").unwrap();
         db.import_from_memory("a/a.bin", b"1").unwrap();
 
         let paths: Vec<&str> = db.paths().collect();
         assert_eq!(paths, vec!["a/a.bin", "b/b.bin"]);
         assert_eq!(db.keys().count(), 2);
+    }
+
+    #[test]
+    fn data_lives_in_single_file_on_disk() {
+        let tmp = TempDir::new();
+        std::fs::write(tmp.0.join("icon.png"), b"png-bytes").unwrap();
+
+        let key = {
+            let mut db = AssetDatabase::new(&tmp.0).unwrap();
+            assert_eq!(db.db_file(), tmp.0.join("assets.db").as_path());
+            let key = db.import_from_disk("icon.png").unwrap();
+            db.import_from_memory("sound/a.wav", b"wave-data").unwrap();
+            assert!(db.db_file().exists());
+            key
+        };
+
+        // The single database file on disk holds the imported payloads.
+        let raw = std::fs::read(tmp.0.join("assets.db")).unwrap();
+        assert!(raw.windows(b"png-bytes".len()).any(|w| w == b"png-bytes"));
+        assert!(raw
+            .windows(b"wave-data".len())
+            .any(|w| w == b"wave-data"));
+        assert!(raw.windows(b"icon.png".len()).any(|w| w == b"icon.png"));
+
+        // Reopening rebuilds the index from disk; data is read on demand.
+        let db = AssetDatabase::new(&tmp.0).unwrap();
+        assert_eq!(db.len(), 2);
+        assert!(!db.is_empty());
+        assert_eq!(
+            db.paths().collect::<Vec<_>>(),
+            vec!["icon.png", "sound/a.wav"]
+        );
+        assert_eq!(db.keys().count(), 2);
+        assert!(db.contains_key(key));
+        assert!(db.contains_path("sound/a.wav"));
+        assert_eq!(db.key_for_path("icon.png"), Some(key));
+        assert_eq!(db.get(key).unwrap().data(), b"png-bytes".as_slice());
+        assert_eq!(
+            db.get_by_path("sound/a.wav")
+                .unwrap()
+                .data(),
+            b"wave-data".as_slice()
+        );
+    }
+
+    #[test]
+    fn reimport_after_reopen_replaces_data() {
+        let tmp = TempDir::new();
+        {
+            let mut db = AssetDatabase::new(&tmp.0).unwrap();
+            db.import_from_memory("x.txt", b"v1").unwrap();
+        }
+        let mut db = AssetDatabase::new(&tmp.0).unwrap();
+        assert_eq!(
+            db.get_by_path("x.txt").unwrap().data(),
+            b"v1".as_slice()
+        );
+        let key = db.import_from_memory("x.txt", b"v2").unwrap();
+        assert_eq!(key, AssetKey::from_path("x.txt"));
+        assert_eq!(db.len(), 1);
+        assert_eq!(db.get(key).unwrap().data(), b"v2".as_slice());
+    }
+
+    #[test]
+    fn opening_db_with_corrupt_file_fails() {
+        let tmp = TempDir::new();
+        std::fs::write(tmp.0.join("assets.db"), b"definitely not a db").unwrap();
+        assert!(matches!(
+            AssetDatabase::new(&tmp.0),
+            Err(DbError::InvalidFile(_))
+        ));
+    }
+
+    #[test]
+    fn binary_asset_round_trips_through_file() {
+        let tmp = TempDir::new();
+        let big: Vec<u8> = (0..256u16).flat_map(|i| [i as u8, (i >> 8) as u8]).collect();
+        let mut db = AssetDatabase::new(&tmp.0).unwrap();
+        let key = db.import_from_memory("blob.bin", big.clone()).unwrap();
+        assert_eq!(db.get(key).unwrap().data(), big.as_slice());
+        drop(db);
+
+        let db = AssetDatabase::new(&tmp.0).unwrap();
+        assert_eq!(db.get(key).unwrap().data(), big.as_slice());
     }
 }
