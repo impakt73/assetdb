@@ -1,7 +1,7 @@
 pub mod db;
 pub mod vfs;
 
-pub use db::{Asset, AssetDatabase, AssetKey, DbError};
+pub use db::{Asset, AssetDatabase, AssetKey, DbError, IntegrityProblem, IntegrityReport};
 pub use vfs::{normalize_path, Vfs};
 
 pub fn add(left: u64, right: u64) -> u64 {

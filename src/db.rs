@@ -124,6 +124,69 @@ impl Asset {
     }
 }
 
+/// A data integrity problem detected by `AssetDatabase::verify_integrity`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntegrityProblem {
+    /// Normalized relative path of the affected asset.
+    pub path: String,
+    /// Size in bytes recorded in the database metadata.
+    pub expected_size: u64,
+    /// Size in bytes of the asset data actually found in the database file.
+    pub actual_size: u64,
+    /// SHA-256 of the asset data (hex) recorded in the database metadata
+    /// when the asset was added or last updated.
+    pub stored_hash: String,
+    /// SHA-256 (hex) of the asset data currently in the database file.
+    pub actual_hash: String,
+    /// Human-readable description of the mismatch.
+    pub detail: String,
+}
+
+impl fmt::Display for IntegrityProblem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.path, self.detail)
+    }
+}
+
+/// The result of an integrity check over the whole database.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IntegrityReport {
+    /// Number of assets that were checked.
+    pub checked: usize,
+    /// Detected integrity problems; empty if all checked assets are intact.
+    pub problems: Vec<IntegrityProblem>,
+}
+
+impl IntegrityReport {
+    /// Whether no integrity problems were detected.
+    pub fn is_clean(&self) -> bool {
+        self.problems.is_empty()
+    }
+}
+
+impl fmt::Display for IntegrityReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.problems.is_empty() {
+            write!(
+                f,
+                "integrity check passed: {} asset(s) verified",
+                self.checked
+            )
+        } else {
+            writeln!(
+                f,
+                "integrity check failed: {} of {} asset(s) corrupted",
+                self.problems.len(),
+                self.checked
+            )?;
+            for problem in &self.problems {
+                writeln!(f, "  {problem}")?;
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Name of the single database file that stores all asset data, kept
 /// inside the root asset directory.
 pub const DB_FILE_NAME: &str = "assets.db";
@@ -180,6 +243,10 @@ impl AssetDatabase {
     ///
     /// `relative_path` is the path of the file relative to the root, for
     /// example `"models/cube.obj"`. Returns the key of the imported asset.
+    ///
+    /// The asset's content hash is computed on import and stored with the
+    /// record so the data can later be checked with
+    /// [`AssetDatabase::verify_integrity`].
     pub fn import_from_disk(&mut self, relative_path: &str) -> Result<AssetKey, DbError> {
         let path = normalize_path(relative_path)?;
         let data = std::fs::read(self.root.join(&path))?;
@@ -189,7 +256,12 @@ impl AssetDatabase {
     /// Import an asset from in-memory data at `relative_path`.
     ///
     /// Re-importing the same relative path keeps a single record and
-    /// replaces its data. Returns the key of the asset.
+    /// replaces its data (and its stored content hash). Returns the key of
+    /// the asset.
+    ///
+    /// The asset's content hash is computed on import and stored with the
+    /// record so the data can later be checked with
+    /// [`AssetDatabase::verify_integrity`].
     pub fn import_from_memory(
         &mut self,
         relative_path: &str,
@@ -264,6 +336,19 @@ impl AssetDatabase {
     /// Whether the database holds no assets.
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
+    }
+
+    /// Check that the data of every stored asset still matches the
+    /// content hash recorded when it was added or last updated.
+    ///
+    /// Each asset's data is re-read from the single database file on disk,
+    /// hashed, and compared against the hash stored in its record. Returns
+    /// a report describing any detected data integrity problems — for each
+    /// affected asset the path, the expected and actual sizes, and both
+    /// hash values. An error means the check could not be completed (e.g.
+    /// the database file could not be read).
+    pub fn verify_integrity(&self) -> Result<IntegrityReport, DbError> {
+        self.vfs.verify_integrity()
     }
 }
 
@@ -501,6 +586,97 @@ mod tests {
             AssetDatabase::new(&tmp.0),
             Err(DbError::InvalidFile(_))
         ));
+    }
+
+    #[test]
+    fn integrity_check_passes_for_intact_database() {
+        let tmp = TempDir::new();
+        let mut db = AssetDatabase::new(&tmp.0).unwrap();
+        // An empty database is trivially clean.
+        let report = db.verify_integrity().unwrap();
+        assert!(report.is_clean());
+        assert_eq!(report.checked, 0);
+
+        std::fs::create_dir_all(tmp.0.join("models")).unwrap();
+        std::fs::write(tmp.0.join("models/cube.obj"), b"v 0 0 0").unwrap();
+        db.import_from_disk("models/cube.obj").unwrap();
+        db.import_from_memory("note.txt", b"hello").unwrap();
+        db.import_from_memory("sound/a.wav", b"wave-data").unwrap();
+
+        let report = db.verify_integrity().unwrap();
+        assert!(report.is_clean());
+        assert_eq!(report.checked, 3);
+        assert!(report.problems.is_empty());
+        // The report renders human-readably.
+        assert!(report.to_string().contains("integrity check passed"));
+    }
+
+    #[test]
+    fn integrity_check_detects_corrupted_payload_after_reopen() {
+        let tmp = TempDir::new();
+        let db_file = tmp.0.join("assets.db");
+        {
+            let mut db = AssetDatabase::new(&tmp.0).unwrap();
+            db.import_from_memory("good.bin", b"0123456789").unwrap();
+            db.import_from_memory("bad.bin", b"abcdef").unwrap();
+            // Update the same asset: the stored hash must follow the
+            // latest data.
+            db.import_from_memory("bad.bin", b"ghijkl").unwrap();
+        }
+
+        // On-disk layout (version 2):
+        //   [header: 8 bytes]
+        //   rec good.bin : [76 header][8 path][10 data]  offsets   8..102
+        //   rec bad.bin v1: [76 header][7 path][ 6 data] offsets 102..191
+        //   rec bad.bin v2: [76 header][7 path][ 6 data] offsets 191..280
+        // The data of the latest bad.bin record starts at 191 + 76 + 7 = 274.
+        let mut raw = std::fs::read(&db_file).unwrap();
+        assert_eq!(raw.len(), 280);
+        raw[274 + 2] ^= 0xff;
+        std::fs::write(&db_file, &raw).unwrap();
+
+        let mut corrupted = b"ghijkl".to_vec();
+        corrupted[2] ^= 0xff;
+
+        let db = AssetDatabase::new(&tmp.0).unwrap();
+        let report = db.verify_integrity().unwrap();
+        assert_eq!(report.checked, 2);
+        assert!(!report.is_clean());
+        assert_eq!(report.problems.len(), 1);
+        let problem = &report.problems[0];
+        assert_eq!(problem.path, "bad.bin");
+        assert_eq!(problem.expected_size, 6);
+        assert_eq!(problem.actual_size, 6);
+        // The stored hash is that of the latest version of the data.
+        assert_eq!(problem.stored_hash, sha256::digest(b"ghijkl"));
+        assert_eq!(problem.actual_hash, sha256::digest(&corrupted));
+        assert_ne!(problem.stored_hash, problem.actual_hash);
+        assert!(problem.detail.contains("hash mismatch"));
+        assert!(report.to_string().contains("bad.bin"));
+    }
+
+    #[test]
+    fn integrity_check_reports_truncated_data() {
+        let tmp = TempDir::new();
+        let db_file = tmp.0.join("assets.db");
+        let mut db = AssetDatabase::new(&tmp.0).unwrap();
+        db.import_from_memory("a.bin", b"0123456789abcdef").unwrap();
+
+        // Shrink the file out from under the open handle, leaving only 4
+        // of the record's 16 data bytes:
+        //   [header: 8][record header: 76][path: 5] = 89, + 4 data bytes.
+        let f = std::fs::OpenOptions::new().write(true).open(&db_file).unwrap();
+        f.set_len(8 + 76 + 5 + 4).unwrap();
+        drop(f);
+
+        let report = db.verify_integrity().unwrap();
+        assert_eq!(report.checked, 1);
+        assert_eq!(report.problems.len(), 1);
+        let problem = &report.problems[0];
+        assert_eq!(problem.path, "a.bin");
+        assert_eq!(problem.expected_size, 16);
+        assert_eq!(problem.actual_size, 4);
+        assert!(problem.detail.contains("only 4 of 16 bytes found"));
     }
 
     #[test]

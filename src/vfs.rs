@@ -8,12 +8,13 @@ use std::os::unix::fs::FileExt as _;
 #[cfg(windows)]
 use std::os::windows::fs::FileExt as _;
 
-use crate::db::DbError;
+use crate::db::{DbError, IntegrityProblem, IntegrityReport};
 
 const MAGIC: &[u8; 4] = b"AVFS";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const HEADER_LEN: u64 = 8;
-const RECORD_HEADER_LEN: u64 = 12; // path_len u32 + data_len u64
+const HASH_LEN: u64 = 64; // lowercase hex-encoded SHA-256 content hash
+const RECORD_HEADER_LEN: u64 = 12 + HASH_LEN; // path_len u32 + data_len u64 + hex hash
 
 /// A virtual file system backed by a single database file on disk.
 ///
@@ -27,10 +28,17 @@ const RECORD_HEADER_LEN: u64 = 12; // path_len u32 + data_len u64
 /// ```text
 /// [ "AVFS" ][ version u32 LE ]            (header)
 /// [ path_len u32 LE ][ data_len u64 LE ]  (record header)
+/// [ sha256 hash of the data (64 lowercase hex chars) ]
 /// [ path bytes (UTF-8, normalized) ]
 /// [ data bytes ]
 /// ... more records, appended in insertion order
 /// ```
+///
+/// Each record stores the lowercase hex-encoded SHA-256 hash of its data,
+/// computed when the record is written (via the `sha256` crate).
+/// `Vfs::verify_integrity` re-reads and re-hashes the data that is
+/// currently on disk and reports every record whose data no longer matches
+/// the stored hash.
 ///
 /// Re-inserting a path appends a new record; the index keeps the latest
 /// one. A truncated tail (e.g. from a crash mid-write) is discarded when
@@ -43,12 +51,15 @@ pub struct Vfs {
     index: BTreeMap<String, Record>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Record {
     /// Byte offset of the data payload within the database file.
     offset: u64,
     /// Length of the data payload.
     len: u64,
+    /// Lowercase hex-encoded SHA-256 hash of the data payload, recorded
+    /// when the record was written.
+    hash: String,
 }
 
 impl Vfs {
@@ -120,6 +131,10 @@ impl Vfs {
                 let path_len =
                     u32::from_le_bytes(rec_header[0..4].try_into().unwrap()) as u64;
                 let data_len = u64::from_le_bytes(rec_header[4..12].try_into().unwrap());
+                let hash = match std::str::from_utf8(&rec_header[12..12 + HASH_LEN as usize]) {
+                    Ok(hash) => hash.to_string(),
+                    Err(_) => break, // malformed hash: treat as torn tail
+                };
                 let data_offset = pos + RECORD_HEADER_LEN + path_len;
                 if data_offset + data_len > file_len {
                     break; // record runs past end of file: torn tail
@@ -132,7 +147,14 @@ impl Vfs {
                     Ok(name) => name.to_string(),
                     Err(_) => break,
                 };
-                index.insert(name, Record { offset: data_offset, len: data_len });
+                index.insert(
+                    name,
+                    Record {
+                        offset: data_offset,
+                        len: data_len,
+                        hash,
+                    },
+                );
                 pos = data_offset + data_len;
             }
 
@@ -239,6 +261,7 @@ impl Vfs {
     }
 
     fn append(&mut self, path: &str, data: &[u8]) -> Result<(), DbError> {
+        let hash = sha256::digest(data);
         let path_len = path.len() as u32;
         let data_offset = self.end + RECORD_HEADER_LEN + path.len() as u64;
         let mut record = Vec::with_capacity(
@@ -246,6 +269,7 @@ impl Vfs {
         );
         record.extend_from_slice(&path_len.to_le_bytes());
         record.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        record.extend_from_slice(hash.as_bytes());
         record.extend_from_slice(path.as_bytes());
         record.extend_from_slice(data);
         let written = self.file.write_at(&record, self.end).map_err(DbError::Io)?;
@@ -267,9 +291,66 @@ impl Vfs {
             Record {
                 offset: data_offset,
                 len: data.len() as u64,
+                hash,
             },
         );
         Ok(())
+    }
+
+    /// Check every stored file against the hash recorded when it was
+    /// written.
+    ///
+    /// The data of every file is re-read from the database file, hashed,
+    /// and compared against the hash stored in the file's record header.
+    /// Returns a report describing any detected integrity problems: for
+    /// each affected asset the path, the expected and actual sizes, and
+    /// both hash values. I/O failures surface as an error, since the
+    /// check could not be completed.
+    pub fn verify_integrity(&self) -> Result<IntegrityReport, DbError> {
+        let mut checked = 0usize;
+        let mut problems = Vec::new();
+        for (path, record) in &self.index {
+            checked += 1;
+            let (actual_size, actual_hash) = self.hash_record_data(record)?;
+            if actual_size != record.len || actual_hash != record.hash {
+                let detail = if actual_size != record.len {
+                    format!(
+                        "only {actual_size} of {} bytes found at offset {} (expected {})",
+                        record.len, record.offset, record.len
+                    )
+                } else {
+                    format!(
+                        "hash mismatch: stored {}, current {}",
+                        record.hash, actual_hash
+                    )
+                };
+                problems.push(IntegrityProblem {
+                    path: path.clone(),
+                    expected_size: record.len,
+                    actual_size,
+                    stored_hash: record.hash.clone(),
+                    actual_hash,
+                    detail,
+                });
+            }
+        }
+        Ok(IntegrityReport { checked, problems })
+    }
+
+    /// Read and hash the bytes a record's data currently occupies in the
+    /// database file.
+    ///
+    /// Returns the number of bytes actually read (less than the recorded
+    /// length if the file was truncated out from under the open handle)
+    /// and the lowercase hex-encoded SHA-256 hash of exactly those bytes.
+    fn hash_record_data(&self, record: &Record) -> Result<(u64, String), DbError> {
+        let mut data = vec![0u8; record.len as usize];
+        let read = self
+            .file
+            .read_at(&mut data, record.offset)
+            .map_err(DbError::Io)?;
+        data.truncate(read as usize);
+        Ok((read as u64, sha256::digest(&data)))
     }
 }
 

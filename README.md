@@ -5,7 +5,8 @@ or memory, identified by a stable hash key, and stored in a **single database
 file on disk** so that opening the database never loads all asset data into
 memory at once.
 
-The crate has no external dependencies.
+The crate's only external dependency is the `sha256` crate, used to hash
+stored asset data.
 
 ## Design
 
@@ -28,14 +29,15 @@ a small in-memory index rebuilt from it.
 
 `Vfs` is a virtual file system backed by the single `assets.db` file. All
 stored file contents live in one **append-only log**; only a lightweight
-in-memory index of `path -> (offset, length)` is kept, so stored data is read
-from disk on demand, one file at a time.
+in-memory index of `path -> (offset, length, content hash)` is kept, so stored
+data is read from disk on demand, one file at a time.
 
-File format:
+File format (version 2):
 
 ```text
 [ "AVFS" ][ version u32 LE ]            (header, 8 bytes)
 [ path_len u32 LE ][ data_len u64 LE ]  (record header, 12 bytes)
+[ sha256 hash of the data (64 lowercase hex chars) ]
 [ path bytes (UTF-8, normalized) ]
 [ data bytes ]
 ... more records, appended in insertion order
@@ -53,6 +55,10 @@ File format:
 - **Corruption guard**: reads and writes verify the number of bytes actually
   transferred, so a file modified underneath an open handle (short read/write)
   surfaces as an error instead of silently returning zero-padded data.
+- **Content hashes**: every record stores the lowercase hex-encoded SHA-256
+  hash of its data, computed when the record is written (via the `sha256`
+  crate). `Vfs::verify_integrity` re-reads and re-hashes each stored file and
+  reports every mismatch.
 
 ### `AssetKey`
 
@@ -89,7 +95,38 @@ all refer to the same asset.
   read from the database file on demand.
 - `paths()`, `keys()`, `key_for_path`, `contains_key`, `contains_path`,
   `len`, `is_empty` — index queries.
+- `verify_integrity()` — check every stored asset against the content hash
+  recorded when it was added or last updated; returns an `IntegrityReport`.
 - `root()`, `db_file()` — the root directory and the single database file.
+
+### File integrity
+
+Because every record stores the SHA-256 hash of its data, the database can
+detect corruption at any time without trusting anything:
+
+```rust
+let report = db.verify_integrity()?;
+if report.is_clean() {
+    println!("{report}"); // "integrity check passed: 3 asset(s) verified"
+} else {
+    for problem in &report.problems {
+        eprintln!("corrupt asset: {problem}");
+    }
+}
+```
+
+`IntegrityProblem` carries everything needed to identify and report the
+affected asset:
+
+- `path` — the asset's relative path,
+- `expected_size` / `actual_size` — recorded size vs. bytes actually found,
+- `stored_hash` / `actual_hash` — both SHA-256 hashes as hex strings,
+- `detail` — a human-readable explanation of the mismatch.
+
+The check re-reads the data of every asset from the database file, so it
+catches both byte-level corruption (hash mismatch, sizes unchanged) and
+truncation (fewer bytes on disk than recorded). I/O failures surface as
+`DbError`, since the check could not be completed.
 
 ### Errors
 
@@ -121,6 +158,10 @@ fn main() -> Result<(), DbError> {
     // Keys are stable hex strings; re-opening the database restores everything.
     let key = AssetKey::from_str(&disk_key.to_hex())?;
     let _again = AssetDatabase::new("/srv/assets")?;
+
+    // Check stored data against the hashes recorded at import time.
+    let report = db.verify_integrity()?;
+    assert!(report.is_clean());
     Ok(())
 }
 ```
