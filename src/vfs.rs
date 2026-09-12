@@ -11,16 +11,18 @@ use std::os::windows::fs::FileExt as _;
 use crate::db::{DbError, IntegrityProblem, IntegrityReport};
 
 const MAGIC: &[u8; 4] = b"AVFS";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
+const LEGACY_VERSION: u32 = 2;
 const HEADER_LEN: u64 = 8;
 const HASH_LEN: u64 = 64; // lowercase hex-encoded SHA-256 content hash
-const RECORD_HEADER_LEN: u64 = 12 + HASH_LEN; // path_len u32 + data_len u64 + hex hash
+const RECORD_HEADER_LEN: u64 = 16 + HASH_LEN; // path_len u32 + data_len u64 + metadata_len u32 + hex hash
+const LEGACY_RECORD_HEADER_LEN: u64 = 12 + HASH_LEN;
 const TOMBSTONE_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// A virtual file system backed by a single database file on disk.
 ///
 /// All file contents live in one append-only log file; only a small
-/// in-memory index of `path -> (offset, length)` records is kept, so
+/// in-memory index of `path -> (offset, length, metadata)` records is kept, so
 /// opening the file system never loads the stored data into memory.
 /// Data is read from disk on demand, one file at a time.
 ///
@@ -28,15 +30,17 @@ const TOMBSTONE_HASH: &str = "00000000000000000000000000000000000000000000000000
 ///
 /// ```text
 /// [ "AVFS" ][ version u32 LE ]            (header)
-/// [ path_len u32 LE ][ data_len u64 LE ]  (record header)
+/// [ path_len u32 LE ][ data_len u64 LE ][ metadata_len u32 LE ] (record header)
 /// [ sha256 hash of the data (64 lowercase hex chars) ]
+/// [ metadata bytes ]
 /// [ path bytes (UTF-8, normalized) ]
 /// [ data bytes ]
 /// ... more records, appended in insertion order
 /// ```
 ///
-/// Each record stores the lowercase hex-encoded SHA-256 hash of its data,
-/// computed when the record is written (via the `sha256` crate).
+/// Each record stores opaque metadata and the lowercase hex-encoded SHA-256
+/// hash of its data, computed when the record is written (via the `sha256`
+/// crate).
 /// `Vfs::verify_integrity` re-reads and re-hashes the data that is
 /// currently on disk and reports every record whose data no longer matches
 /// the stored hash.
@@ -61,6 +65,8 @@ struct Record {
     /// Lowercase hex-encoded SHA-256 hash of the data payload, recorded
     /// when the record was written.
     hash: String,
+    /// Opaque record metadata. It is indexed independently from the payload.
+    metadata: Vec<u8>,
 }
 
 impl Vfs {
@@ -89,6 +95,7 @@ impl Vfs {
             .map_err(DbError::Io)?;
         let mut end = file.metadata().map_err(DbError::Io)?.len();
         let mut index = BTreeMap::new();
+        let mut legacy_file = false;
 
         if end == 0 {
             // Brand-new file: write the header.
@@ -107,38 +114,69 @@ impl Vfs {
             let mut header = [0u8; HEADER_LEN as usize];
             file.seek(SeekFrom::Start(0)).map_err(DbError::Io)?;
             file.read_exact(&mut header).map_err(DbError::Io)?;
-            if &header[0..4] != MAGIC
-                || u32::from_le_bytes(header[4..8].try_into().unwrap()) != VERSION
-            {
+            let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
+            if &header[0..4] != MAGIC || ![LEGACY_VERSION, VERSION].contains(&version) {
                 return Err(DbError::InvalidFile(format!(
                     "{}: not a virtual file system database (bad header)",
                     path.display()
                 )));
             }
 
+            let legacy = version == LEGACY_VERSION;
+            legacy_file = legacy;
+            let record_header_len = if legacy {
+                LEGACY_RECORD_HEADER_LEN
+            } else {
+                RECORD_HEADER_LEN
+            };
+
             // Walk the log and index each record; keep the latest record
             // per path. Stop at the first incomplete or malformed record.
             let file_len = end;
             let mut pos = HEADER_LEN;
             while pos < file_len {
-                if file_len - pos < RECORD_HEADER_LEN {
+                if file_len - pos < record_header_len {
                     break;
                 }
-                let mut rec_header = [0u8; RECORD_HEADER_LEN as usize];
+                let mut rec_header = vec![0u8; record_header_len as usize];
                 file.seek(SeekFrom::Start(pos)).map_err(DbError::Io)?;
                 file.read_exact(&mut rec_header).map_err(DbError::Io)?;
                 let path_len = u32::from_le_bytes(rec_header[0..4].try_into().unwrap()) as u64;
                 let data_len = u64::from_le_bytes(rec_header[4..12].try_into().unwrap());
-                let hash = match std::str::from_utf8(&rec_header[12..12 + HASH_LEN as usize]) {
+                let metadata_len = if legacy {
+                    0
+                } else {
+                    u32::from_le_bytes(rec_header[12..16].try_into().unwrap()) as u64
+                };
+                let hash_start = if legacy { 12 } else { 16 };
+                let hash = match std::str::from_utf8(
+                    &rec_header[hash_start..hash_start + HASH_LEN as usize],
+                ) {
                     Ok(hash) => hash.to_string(),
                     Err(_) => break, // malformed hash: treat as torn tail
                 };
-                let data_offset = pos + RECORD_HEADER_LEN + path_len;
-                if data_offset + data_len > file_len {
+                let metadata_offset = pos + record_header_len;
+                let path_offset = match metadata_offset.checked_add(metadata_len) {
+                    Some(offset) => offset,
+                    None => break,
+                };
+                let data_offset = match path_offset.checked_add(path_len) {
+                    Some(offset) => offset,
+                    None => break,
+                };
+                let record_end = match data_offset.checked_add(data_len) {
+                    Some(offset) => offset,
+                    None => break,
+                };
+                if record_end > file_len {
                     break; // record runs past end of file: torn tail
                 }
+                let mut metadata = vec![0u8; metadata_len as usize];
+                file.seek(SeekFrom::Start(metadata_offset))
+                    .map_err(DbError::Io)?;
+                file.read_exact(&mut metadata).map_err(DbError::Io)?;
                 let mut path_bytes = vec![0u8; path_len as usize];
-                file.seek(SeekFrom::Start(pos + RECORD_HEADER_LEN))
+                file.seek(SeekFrom::Start(path_offset))
                     .map_err(DbError::Io)?;
                 file.read_exact(&mut path_bytes).map_err(DbError::Io)?;
                 let name = match std::str::from_utf8(&path_bytes) {
@@ -154,6 +192,7 @@ impl Vfs {
                             offset: data_offset,
                             len: data_len,
                             hash,
+                            metadata,
                         },
                     );
                 }
@@ -167,12 +206,19 @@ impl Vfs {
             }
         }
 
-        Ok(Self {
+        let mut vfs = Self {
             path: path.to_path_buf(),
             file,
             end,
             index,
-        })
+        };
+        if legacy_file {
+            // Rewrite old records once so all subsequent appends use the new
+            // layout and old records receive inferred metadata at the asset
+            // database layer.
+            vfs.compact()?;
+        }
+        Ok(vfs)
     }
 
     /// The path of the single database file backing this file system.
@@ -189,14 +235,28 @@ impl Vfs {
         relative_path: &str,
         data: impl Into<Vec<u8>>,
     ) -> Result<Option<Vec<u8>>, DbError> {
+        self.insert_with_metadata(relative_path, [], data)
+    }
+
+    /// Insert (or replace) a file and attach opaque metadata to its record.
+    ///
+    /// Metadata is stored and indexed separately from the payload. Looking up
+    /// metadata never reads the payload bytes.
+    pub fn insert_with_metadata(
+        &mut self,
+        relative_path: &str,
+        metadata: impl Into<Vec<u8>>,
+        data: impl Into<Vec<u8>>,
+    ) -> Result<Option<Vec<u8>>, DbError> {
         let path = normalize_path(relative_path)?;
+        let metadata = metadata.into();
         let data = data.into();
         let previous = self
             .index
             .get(&path)
             .map(|record| self.read_data(record))
             .transpose()?;
-        self.append(&path, &data)?;
+        self.append(&path, &metadata, &data)?;
         Ok(previous)
     }
 
@@ -207,6 +267,19 @@ impl Vfs {
         let path = normalize_path(relative_path).ok()?;
         let record = self.index.get(&path)?;
         self.read_data(record).ok()
+    }
+
+    /// Return a copy of a file's opaque record metadata without reading its
+    /// payload.
+    pub fn metadata(&self, relative_path: &str) -> Option<Vec<u8>> {
+        let path = normalize_path(relative_path).ok()?;
+        self.index.get(&path).map(|record| record.metadata.clone())
+    }
+
+    /// Return the recorded payload length without reading the payload.
+    pub fn data_len(&self, relative_path: &str) -> Option<u64> {
+        let path = normalize_path(relative_path).ok()?;
+        self.index.get(&path).map(|record| record.len)
     }
 
     /// Whether a file exists at the (normalized) relative path.
@@ -245,7 +318,11 @@ impl Vfs {
         let _ = std::fs::remove_file(&temporary);
         let mut replacement = Self::create(&temporary)?;
         for (current_path, current_record) in &self.index {
-            replacement.insert(current_path, self.read_data(current_record)?)?;
+            replacement.insert_with_metadata(
+                current_path,
+                current_record.metadata.clone(),
+                self.read_data(current_record)?,
+            )?;
         }
         replacement.flush()?;
         drop(replacement);
@@ -292,14 +369,24 @@ impl Vfs {
         Ok(data)
     }
 
-    fn append(&mut self, path: &str, data: &[u8]) -> Result<(), DbError> {
+    fn append(&mut self, path: &str, metadata: &[u8], data: &[u8]) -> Result<(), DbError> {
         let hash = sha256::digest(data);
         let path_len = path.len() as u32;
-        let data_offset = self.end + RECORD_HEADER_LEN + path.len() as u64;
-        let mut record = Vec::with_capacity(RECORD_HEADER_LEN as usize + path.len() + data.len());
+        let metadata_len = u32::try_from(metadata.len()).map_err(|_| {
+            DbError::InvalidFile(format!(
+                "record metadata is too large: {} bytes",
+                metadata.len()
+            ))
+        })?;
+        let data_offset = self.end + RECORD_HEADER_LEN + metadata.len() as u64 + path.len() as u64;
+        let mut record = Vec::with_capacity(
+            RECORD_HEADER_LEN as usize + metadata.len() + path.len() + data.len(),
+        );
         record.extend_from_slice(&path_len.to_le_bytes());
         record.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        record.extend_from_slice(&metadata_len.to_le_bytes());
         record.extend_from_slice(hash.as_bytes());
+        record.extend_from_slice(metadata);
         record.extend_from_slice(path.as_bytes());
         record.extend_from_slice(data);
         let written = self.file.write_at(&record, self.end).map_err(DbError::Io)?;
@@ -322,6 +409,7 @@ impl Vfs {
                 offset: data_offset,
                 len: data.len() as u64,
                 hash,
+                metadata: metadata.to_vec(),
             },
         );
         Ok(())
@@ -332,6 +420,7 @@ impl Vfs {
         let mut record = Vec::with_capacity(RECORD_HEADER_LEN as usize + path.len());
         record.extend_from_slice(&path_len.to_le_bytes());
         record.extend_from_slice(&0u64.to_le_bytes());
+        record.extend_from_slice(&0u32.to_le_bytes());
         record.extend_from_slice(TOMBSTONE_HASH.as_bytes());
         record.extend_from_slice(path.as_bytes());
         let written = self.file.write_at(&record, self.end).map_err(DbError::Io)?;
@@ -554,6 +643,46 @@ mod tests {
         assert_eq!(vfs.get("b/c.bin"), Some(b"beta-beta".to_vec()));
         let paths: Vec<&str> = vfs.paths().collect();
         assert_eq!(paths, vec!["a.bin", "b/c.bin"]);
+    }
+
+    #[test]
+    fn record_metadata_persists_without_loading_payload() {
+        let tmp = TempDir::new();
+        let file = tmp.db_file();
+        {
+            let mut vfs = Vfs::open(&file).unwrap();
+            vfs.insert_with_metadata("asset.bin", b"record metadata", b"payload")
+                .unwrap();
+            assert_eq!(vfs.metadata("asset.bin"), Some(b"record metadata".to_vec()));
+        }
+
+        let vfs = Vfs::open(&file).unwrap();
+        assert_eq!(vfs.metadata("asset.bin"), Some(b"record metadata".to_vec()));
+        assert_eq!(vfs.data_len("asset.bin"), Some(7));
+    }
+
+    #[test]
+    fn migrates_legacy_version_two_files() {
+        let tmp = TempDir::new();
+        let file = tmp.db_file();
+        let path = b"legacy.bin";
+        let data = b"legacy payload";
+        let hash = sha256::digest(data);
+        let mut raw = Vec::new();
+        raw.extend_from_slice(MAGIC);
+        raw.extend_from_slice(&LEGACY_VERSION.to_le_bytes());
+        raw.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        raw.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        raw.extend_from_slice(hash.as_bytes());
+        raw.extend_from_slice(path);
+        raw.extend_from_slice(data);
+        std::fs::write(&file, raw).unwrap();
+
+        let vfs = Vfs::open(&file).unwrap();
+        assert_eq!(vfs.get("legacy.bin"), Some(data.to_vec()));
+        assert_eq!(vfs.metadata("legacy.bin"), Some(Vec::new()));
+        let header = std::fs::read(&file).unwrap();
+        assert_eq!(&header[4..8], &VERSION.to_le_bytes());
     }
 
     #[test]

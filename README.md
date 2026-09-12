@@ -1,9 +1,9 @@
 # asset-server
 
-A simple asset database for game/server assets. Assets are imported from disk
-or memory, identified by a stable hash key, and stored in a **single database
-file on disk** so that opening the database never loads all asset data into
-memory at once.
+A simple asset database for game/server assets. Asset records are imported from
+disk or memory, identified by a stable hash key, and stored with type and data
+format metadata in a **single database file on disk**. Opening the database
+indexes records without loading or decoding the binary asset data.
 
 The crate's only external dependency is the `sha256` crate, used to hash
 stored asset data.
@@ -23,21 +23,22 @@ A database is rooted at an asset directory (`root`):
 
 `AssetDatabase::new(root)` opens `<root>/assets.db`, creating it if missing.
 Everything the database knows about its assets is either in that one file or in
-a small in-memory index rebuilt from it.
+a small in-memory record index rebuilt from it.
 
 ### `Vfs`: single-file storage
 
 `Vfs` is a virtual file system backed by the single `assets.db` file. All
 stored file contents live in one **append-only log**; only a lightweight
-in-memory index of `path -> (offset, length, content hash)` is kept, so stored
-data is read from disk on demand, one file at a time.
+in-memory index of `path -> (offset, length, record metadata, content hash)` is
+kept, so stored data is read from disk on demand, one file at a time.
 
-File format (version 2):
+File format (version 3):
 
 ```text
 [ "AVFS" ][ version u32 LE ]            (header, 8 bytes)
-[ path_len u32 LE ][ data_len u64 LE ]  (record header, 12 bytes)
+[ path_len u32 LE ][ data_len u64 LE ][ metadata_len u32 LE ] (record header, 16 bytes)
 [ sha256 hash of the data (64 lowercase hex chars) ]
+[ record metadata bytes ]
 [ path bytes (UTF-8, normalized) ]
 [ data bytes ]
 ... more records, appended in insertion order
@@ -59,6 +60,8 @@ File format (version 2):
   hash of its data, computed when the record is written (via the `sha256`
   crate). `Vfs::verify_integrity` re-reads and re-hashes each stored file and
   reports every mismatch.
+- **Record metadata**: `Vfs` stores opaque metadata separately from the data
+  payload. `Vfs::metadata` can retrieve it without reading the payload.
 
 ### `AssetKey`
 
@@ -82,19 +85,27 @@ all refer to the same asset.
 
 ### `AssetDatabase`
 
-`AssetDatabase` is the high-level API. It keeps only lightweight index entries
-(key, path, file offset) in memory:
+`AssetDatabase` is the high-level API. It keeps lightweight `AssetRecord`
+entries in memory. An `AssetRecord` contains the key, normalized path,
+application-defined asset type, and data format version; it never contains
+binary data:
 
 - `new(root)` — open (or create) the database at `root/assets.db`; existing
   records are indexed and immediately available.
 - `import_from_disk(relative_path)` — copy a file from under `root` into the
-  database.
+  database, deriving the type from the file extension and using data format
+  version 1.
 - `import_from_memory(relative_path, data)` — store in-memory data; re-importing
   the same path replaces its data under the same key.
-- `get(key)` / `get_by_path(relative_path)` — look up an `Asset`; the data is
-  read from the database file on demand.
-- `paths()`, `keys()`, `key_for_path`, `contains_key`, `contains_path`,
-  `len`, `is_empty` — index queries.
+- `import_from_disk_with_metadata` / `import_from_memory_with_metadata` — import
+  data with explicit `AssetMetadata` instead of inferred defaults.
+- `get_record(key)` / `get_record_by_path(relative_path)` — look up an
+  `AssetRecord` without reading the binary data.
+- `get_data(key)` — read the binary data separately as `AssetData`.
+- `get(key)` / `get_by_path(relative_path)` — compatibility convenience that
+  combines a record with loaded data.
+- `records()`, `paths()`, `keys()`, `key_for_path`, `contains_key`,
+  `contains_path`, `len`, `is_empty` — index queries.
 - `verify_integrity()` — check every stored asset against the content hash
   recorded when it was added or last updated; returns an `IntegrityReport`.
 - `root()`, `db_file()` — the root directory and the single database file.
@@ -137,6 +148,7 @@ truncation (fewer bytes on disk than recorded). I/O failures surface as
 - `Io(std::io::Error)` — disk I/O failures (import, read, write, flush).
 - `InvalidFile(String)` — the database file is missing/corrupt/not a database
   (bad header, torn record, short read).
+- `InvalidMetadata(String)` — an asset type is empty or otherwise invalid.
 
 ## Usage
 
@@ -151,9 +163,14 @@ fn main() -> Result<(), DbError> {
     let disk_key = db.import_from_disk("models/cube.obj")?;
     db.import_from_memory("note.txt", b"hello")?;
 
-    // Look up by key or by relative path; data is read from assets.db on demand.
-    let asset = db.get(disk_key).expect("present");
-    let note = db.get_by_path("note.txt").expect("present");
+    // Look up metadata without reading or decoding the binary payload.
+    let record = db.get_record(disk_key).expect("present");
+    assert_eq!(record.asset_type, "obj");
+    assert_eq!(record.data_format_version, 1);
+
+    // Read data separately only when it is needed.
+    let data = db.get_data(disk_key).expect("present");
+    assert!(!data.as_bytes().is_empty());
 
     // Keys are stable hex strings; re-opening the database restores everything.
     let key = AssetKey::from_str(&disk_key.to_hex())?;
@@ -193,11 +210,13 @@ asset-server check ./assets
 ```
 
 `add` imports a source file relative to the database root. Its optional third
-argument is the normalized path stored in the database. `search` matches asset
-paths and hexadecimal keys. `remove` and `dump` accept either a stored path or
-an asset key. Omitting the selector from `dump` exports every asset below the
-destination directory. `check` exits with status 2 when corruption is found
-and status 1 when the database cannot be opened or checked.
+argument is the normalized path stored in the database. The CLI derives the
+asset type from that stored path and uses data format version 1. `search`
+matches asset paths and hexadecimal keys using metadata only. `remove` and
+`dump` accept either a stored path or an asset key. Omitting the selector from
+`dump` exports every asset below the destination directory. `check` exits with
+status 2 when corruption is found and status 1 when the database cannot be
+opened or checked.
 
 `remove` records a deletion without rewriting the database. Use `compact` as a
 separate maintenance operation to reclaim space from removed and replaced

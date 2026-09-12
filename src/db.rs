@@ -81,6 +81,8 @@ pub enum DbError {
     /// The on-disk database file was missing, corrupt, or not a valid
     /// database file.
     InvalidFile(String),
+    /// Asset record metadata was not valid.
+    InvalidMetadata(String),
 }
 
 impl fmt::Display for DbError {
@@ -90,6 +92,7 @@ impl fmt::Display for DbError {
             Self::InvalidKey(key) => write!(f, "invalid asset key: {key:?}"),
             Self::Io(err) => write!(f, "io error: {err}"),
             Self::InvalidFile(msg) => write!(f, "{msg}"),
+            Self::InvalidMetadata(msg) => write!(f, "invalid asset metadata: {msg}"),
         }
     }
 }
@@ -109,18 +112,119 @@ impl From<std::io::Error> for DbError {
     }
 }
 
-/// A single asset record: its key, normalized relative path, and raw data.
+/// The default data format version used by the convenience import methods.
+pub const DEFAULT_DATA_FORMAT_VERSION: u32 = 1;
+
+/// Metadata describing an asset's type and the format of its data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssetMetadata {
+    /// Application-defined asset type, such as `texture`, `mesh`, or `shader`.
+    pub asset_type: String,
+    /// Version of the format used to encode the asset data payload.
+    pub data_format_version: u32,
+}
+
+impl AssetMetadata {
+    /// Construct metadata for an asset.
+    pub fn new(asset_type: impl Into<String>, data_format_version: u32) -> Result<Self, DbError> {
+        let metadata = Self {
+            asset_type: asset_type.into(),
+            data_format_version,
+        };
+        metadata.validate()?;
+        Ok(metadata)
+    }
+
+    fn validate(&self) -> Result<(), DbError> {
+        if self.asset_type.is_empty() {
+            return Err(DbError::InvalidMetadata(
+                "asset type must not be empty".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Metadata-only representation of an asset stored in the database.
+///
+/// This type never contains or loads the binary asset data. Use
+/// [`AssetDatabase::get_data`] when the payload is needed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssetRecord {
+    pub key: AssetKey,
+    pub path: String,
+    pub asset_type: String,
+    pub data_format_version: u32,
+}
+
+impl AssetRecord {
+    /// The application-defined type of the asset.
+    pub fn asset_type(&self) -> &str {
+        &self.asset_type
+    }
+
+    /// The version of the asset data format.
+    pub fn data_format_version(&self) -> u32 {
+        self.data_format_version
+    }
+
+    /// Return the type and data-format version as a value object.
+    pub fn metadata(&self) -> AssetMetadata {
+        AssetMetadata {
+            asset_type: self.asset_type.clone(),
+            data_format_version: self.data_format_version,
+        }
+    }
+}
+
+/// The binary data belonging to an asset record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssetData(Vec<u8>);
+
+impl AssetData {
+    /// Borrow the binary asset data.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Borrow the binary asset data.
+    pub fn data(&self) -> &[u8] {
+        self.as_bytes()
+    }
+
+    /// Consume the wrapper and return the binary asset data.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+/// A compatibility view combining an asset record and its loaded data.
+///
+/// New code that only needs identity or metadata should use
+/// [`AssetDatabase::get_record`], which does not read the data payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Asset {
     pub key: AssetKey,
     pub path: String,
-    data: Vec<u8>,
+    pub asset_type: String,
+    pub data_format_version: u32,
+    data: AssetData,
 }
 
 impl Asset {
     /// The raw data of the asset.
     pub fn data(&self) -> &[u8] {
-        &self.data
+        self.data.as_bytes()
+    }
+
+    /// The metadata-only record represented by this loaded asset.
+    pub fn record(&self) -> AssetRecord {
+        AssetRecord {
+            key: self.key,
+            path: self.path.clone(),
+            asset_type: self.asset_type.clone(),
+            data_format_version: self.data_format_version,
+        }
     }
 }
 
@@ -193,18 +297,18 @@ pub const DB_FILE_NAME: &str = "assets.db";
 
 /// A simple asset database.
 ///
-/// All asset data is stored in a single database file on disk
+/// All asset data and records are stored in a single database file on disk
 /// (`assets.db` inside the root asset directory). Only lightweight
-/// per-asset index entries (key, path, and file offset) are kept in
-/// memory, so opening a database never loads its assets into memory at
-/// once. Each asset's database key is the FNV-1a 64-bit hash of its path
-/// relative to the root asset directory, which keeps assets unique and
-/// lets them be looked up either by key or by relative path.
+/// metadata-only [`AssetRecord`] entries and payload locations are kept in
+/// memory, so opening a database never loads its assets into memory at once.
+/// Each asset's database key is the FNV-1a 64-bit hash of its path relative to
+/// the root asset directory, which keeps assets unique and lets them be looked
+/// up either by key or by relative path.
 #[derive(Debug)]
 pub struct AssetDatabase {
     root: PathBuf,
     vfs: Vfs,
-    keys: BTreeMap<AssetKey, String>,
+    records: BTreeMap<AssetKey, AssetRecord>,
 }
 
 impl AssetDatabase {
@@ -217,11 +321,26 @@ impl AssetDatabase {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, DbError> {
         let root = root.into();
         let vfs = Vfs::open(root.join(DB_FILE_NAME))?;
-        let keys: BTreeMap<AssetKey, String> = vfs
-            .paths()
-            .map(|path| (AssetKey::from_path(path), path.to_string()))
-            .collect();
-        Ok(Self { root, vfs, keys })
+        let mut records = BTreeMap::new();
+        for path in vfs.paths() {
+            let metadata = match vfs.metadata(path) {
+                Some(bytes) if !bytes.is_empty() => decode_metadata(&bytes)?,
+                // Empty metadata is accepted for files written directly via
+                // Vfs. AssetDatabase imports always write explicit metadata.
+                _ => default_metadata(path),
+            };
+            let key = AssetKey::from_path(path);
+            records.insert(
+                key,
+                AssetRecord {
+                    key,
+                    path: path.to_string(),
+                    asset_type: metadata.asset_type,
+                    data_format_version: metadata.data_format_version,
+                },
+            );
+        }
+        Ok(Self { root, vfs, records })
     }
 
     /// The root asset directory.
@@ -249,8 +368,19 @@ impl AssetDatabase {
     /// [`AssetDatabase::verify_integrity`].
     pub fn import_from_disk(&mut self, relative_path: &str) -> Result<AssetKey, DbError> {
         let path = normalize_path(relative_path)?;
+        let metadata = default_metadata(&path);
+        self.import_from_disk_with_metadata(&path, metadata)
+    }
+
+    /// Import an asset from disk with explicit type and data-format metadata.
+    pub fn import_from_disk_with_metadata(
+        &mut self,
+        relative_path: &str,
+        metadata: AssetMetadata,
+    ) -> Result<AssetKey, DbError> {
+        let path = normalize_path(relative_path)?;
         let data = std::fs::read(self.root.join(&path))?;
-        Ok(self.store(path, data))
+        self.store(path, metadata, data)
     }
 
     /// Import an asset from in-memory data at `relative_path`.
@@ -268,54 +398,99 @@ impl AssetDatabase {
         data: impl Into<Vec<u8>>,
     ) -> Result<AssetKey, DbError> {
         let path = normalize_path(relative_path)?;
-        Ok(self.store(path, data.into()))
+        let metadata = default_metadata(&path);
+        self.import_from_memory_with_metadata(&path, data, metadata)
     }
 
-    fn store(&mut self, path: String, data: Vec<u8>) -> AssetKey {
+    /// Import in-memory asset data with explicit type and data-format metadata.
+    pub fn import_from_memory_with_metadata(
+        &mut self,
+        relative_path: &str,
+        data: impl Into<Vec<u8>>,
+        metadata: AssetMetadata,
+    ) -> Result<AssetKey, DbError> {
+        let path = normalize_path(relative_path)?;
+        self.store(path, metadata, data.into())
+    }
+
+    fn store(
+        &mut self,
+        path: String,
+        metadata: AssetMetadata,
+        data: Vec<u8>,
+    ) -> Result<AssetKey, DbError> {
+        metadata.validate()?;
         let key = AssetKey(fnv1a64(path.as_bytes()));
+        let encoded_metadata = encode_metadata(&metadata)?;
         // `path` is already normalized, so this cannot fail.
         self.vfs
-            .insert(&path, data)
-            .expect("normalized path is always a valid vfs path");
-        self.keys.insert(key, path);
-        key
+            .insert_with_metadata(&path, encoded_metadata, data)?;
+        self.records.insert(
+            key,
+            AssetRecord {
+                key,
+                path,
+                asset_type: metadata.asset_type,
+                data_format_version: metadata.data_format_version,
+            },
+        );
+        Ok(key)
     }
 
-    /// Look up an asset record by key.
+    /// Look up metadata for an asset without reading its binary data.
+    pub fn get_record(&self, key: AssetKey) -> Option<AssetRecord> {
+        self.records.get(&key).cloned()
+    }
+
+    /// Look up metadata by normalized relative path without reading data.
+    pub fn get_record_by_path(&self, relative_path: &str) -> Option<AssetRecord> {
+        let path = normalize_path(relative_path).ok()?;
+        let key = AssetKey(fnv1a64(path.as_bytes()));
+        self.get_record(key)
+    }
+
+    /// Read the binary data for an asset independently of its record.
+    pub fn get_data(&self, key: AssetKey) -> Option<AssetData> {
+        let record = self.records.get(&key)?;
+        self.vfs.get(&record.path).map(AssetData)
+    }
+
+    /// Look up an asset and load its binary data by key.
     ///
     /// The asset's data is read from the database file on demand.
     pub fn get(&self, key: AssetKey) -> Option<Asset> {
-        let path = self.keys.get(&key)?;
-        let data = self.vfs.get(path)?;
+        let record = self.records.get(&key)?;
+        let data = self.get_data(key)?;
         Some(Asset {
             key,
-            path: path.clone(),
+            path: record.path.clone(),
+            asset_type: record.asset_type.clone(),
+            data_format_version: record.data_format_version,
             data,
         })
     }
 
-    /// Look up an asset record by (normalized) relative path.
+    /// Look up an asset and load its binary data by (normalized) relative path.
     ///
     /// The asset's data is read from the database file on demand.
     pub fn get_by_path(&self, relative_path: &str) -> Option<Asset> {
         let path = normalize_path(relative_path).ok()?;
         let key = AssetKey(fnv1a64(path.as_bytes()));
-        let data = self.vfs.get(&path)?;
-        Some(Asset { key, path, data })
+        self.get(key)
     }
 
     /// The key for `relative_path`, if an asset with that path is stored.
     pub fn key_for_path(&self, relative_path: &str) -> Option<AssetKey> {
         let key = AssetKey::from_path(relative_path);
-        self.keys.contains_key(&key).then_some(key)
+        self.records.contains_key(&key).then_some(key)
     }
 
     pub fn contains_key(&self, key: AssetKey) -> bool {
-        self.keys.contains_key(&key)
+        self.records.contains_key(&key)
     }
 
     pub fn contains_path(&self, relative_path: &str) -> bool {
-        self.vfs.contains(relative_path)
+        self.get_record_by_path(relative_path).is_some()
     }
 
     /// Remove an asset and persist the removal in the database file.
@@ -325,13 +500,13 @@ impl AssetDatabase {
             return Ok(None);
         };
         self.vfs.remove_persisted(&path)?;
-        self.keys.remove(&asset.key);
+        self.records.remove(&asset.key);
         Ok(Some(asset))
     }
 
     /// Remove an asset by its stable key and persist the removal.
     pub fn remove(&mut self, key: AssetKey) -> Result<Option<Asset>, DbError> {
-        let Some(path) = self.keys.get(&key).cloned() else {
+        let Some(path) = self.records.get(&key).map(|record| record.path.clone()) else {
             return Ok(None);
         };
         self.remove_by_path(&path)
@@ -344,7 +519,12 @@ impl AssetDatabase {
 
     /// Iterate over the keys of all stored assets (sorted).
     pub fn keys(&self) -> impl Iterator<Item = AssetKey> {
-        self.keys.keys().copied()
+        self.records.keys().copied()
+    }
+
+    /// Iterate over all metadata-only asset records in key order.
+    pub fn records(&self) -> impl Iterator<Item = &AssetRecord> {
+        self.records.values()
     }
 
     /// Iterate over the normalized relative paths of all stored assets.
@@ -354,12 +534,12 @@ impl AssetDatabase {
 
     /// Number of assets stored.
     pub fn len(&self) -> usize {
-        self.keys.len()
+        self.records.len()
     }
 
     /// Whether the database holds no assets.
     pub fn is_empty(&self) -> bool {
-        self.keys.is_empty()
+        self.records.is_empty()
     }
 
     /// Check that the data of every stored asset still matches the
@@ -374,6 +554,59 @@ impl AssetDatabase {
     pub fn verify_integrity(&self) -> Result<IntegrityReport, DbError> {
         self.vfs.verify_integrity()
     }
+}
+
+const ASSET_METADATA_MAGIC: &[u8; 4] = b"ARMD";
+const ASSET_METADATA_HEADER_LEN: usize = 12;
+
+fn default_metadata(path: &str) -> AssetMetadata {
+    let file_name = path.rsplit('/').next().unwrap_or(path);
+    let asset_type = file_name
+        .rsplit_once('.')
+        .map(|(_, extension)| extension)
+        .filter(|extension| !extension.is_empty())
+        .unwrap_or("binary")
+        .to_ascii_lowercase();
+    AssetMetadata {
+        asset_type,
+        data_format_version: DEFAULT_DATA_FORMAT_VERSION,
+    }
+}
+
+fn encode_metadata(metadata: &AssetMetadata) -> Result<Vec<u8>, DbError> {
+    metadata.validate()?;
+    let type_len = u32::try_from(metadata.asset_type.len())
+        .map_err(|_| DbError::InvalidMetadata("asset type is too long".to_string()))?;
+    let mut encoded = Vec::with_capacity(ASSET_METADATA_HEADER_LEN + metadata.asset_type.len());
+    encoded.extend_from_slice(ASSET_METADATA_MAGIC);
+    encoded.extend_from_slice(&type_len.to_le_bytes());
+    encoded.extend_from_slice(&metadata.data_format_version.to_le_bytes());
+    encoded.extend_from_slice(metadata.asset_type.as_bytes());
+    Ok(encoded)
+}
+
+fn decode_metadata(encoded: &[u8]) -> Result<AssetMetadata, DbError> {
+    if encoded.len() < ASSET_METADATA_HEADER_LEN || &encoded[..4] != ASSET_METADATA_MAGIC {
+        return Err(DbError::InvalidFile(
+            "asset record has invalid metadata header".to_string(),
+        ));
+    }
+    let type_len = u32::from_le_bytes(encoded[4..8].try_into().unwrap()) as usize;
+    let expected_len = ASSET_METADATA_HEADER_LEN
+        .checked_add(type_len)
+        .ok_or_else(|| DbError::InvalidFile("asset metadata length overflow".to_string()))?;
+    if encoded.len() != expected_len {
+        return Err(DbError::InvalidFile(
+            "asset record has invalid metadata length".to_string(),
+        ));
+    }
+    let asset_type = std::str::from_utf8(&encoded[ASSET_METADATA_HEADER_LEN..])
+        .map_err(|_| DbError::InvalidFile("asset type is not valid UTF-8".to_string()))?;
+    AssetMetadata::new(
+        asset_type,
+        u32::from_le_bytes(encoded[8..12].try_into().unwrap()),
+    )
+    .map_err(|error| DbError::InvalidFile(error.to_string()))
 }
 
 #[cfg(test)]
@@ -447,6 +680,15 @@ mod tests {
         assert_eq!(asset.key, key);
         assert_eq!(asset.path, "textures/sky.png");
         assert_eq!(asset.data(), data);
+
+        let record = db.get_record(key).expect("metadata record found by key");
+        assert_eq!(record.asset_type, "png");
+        assert_eq!(record.data_format_version, DEFAULT_DATA_FORMAT_VERSION);
+        assert_eq!(
+            db.get_record_by_path("./textures/sky.png"),
+            Some(record.clone())
+        );
+        assert_eq!(db.get_data(key).unwrap().as_bytes(), data);
 
         // Look up by relative path.
         let asset = db
@@ -661,15 +903,16 @@ mod tests {
             db.import_from_memory("bad.bin", b"ghijkl").unwrap();
         }
 
-        // On-disk layout (version 2):
+        // On-disk layout (version 3): each default metadata value for a .bin
+        // path is 15 bytes (12-byte metadata header plus "bin").
         //   [header: 8 bytes]
-        //   rec good.bin : [76 header][8 path][10 data]  offsets   8..102
-        //   rec bad.bin v1: [76 header][7 path][ 6 data] offsets 102..191
-        //   rec bad.bin v2: [76 header][7 path][ 6 data] offsets 191..280
-        // The data of the latest bad.bin record starts at 191 + 76 + 7 = 274.
+        //   rec good.bin : [80 header][15 metadata][8 path][10 data]
+        //   rec bad.bin v1: [80 header][15 metadata][7 path][6 data]
+        //   rec bad.bin v2: [80 header][15 metadata][7 path][6 data]
+        // The data of the latest bad.bin record starts at 229 + 80 + 15 + 7 = 331.
         let mut raw = std::fs::read(&db_file).unwrap();
-        assert_eq!(raw.len(), 280);
-        raw[274 + 2] ^= 0xff;
+        assert_eq!(raw.len(), 337);
+        raw[331 + 2] ^= 0xff;
         std::fs::write(&db_file, &raw).unwrap();
 
         let mut corrupted = b"ghijkl".to_vec();
@@ -701,12 +944,13 @@ mod tests {
 
         // Shrink the file out from under the open handle, leaving only 4
         // of the record's 16 data bytes:
-        //   [header: 8][record header: 76][path: 5] = 89, + 4 data bytes.
+        //   [header: 8][record header: 80][metadata: 15][path: 5] = 108,
+        //   + 4 data bytes.
         let f = std::fs::OpenOptions::new()
             .write(true)
             .open(&db_file)
             .unwrap();
-        f.set_len(8 + 76 + 5 + 4).unwrap();
+        f.set_len(8 + 80 + 15 + 5 + 4).unwrap();
         drop(f);
 
         let report = db.verify_integrity().unwrap();
@@ -732,5 +976,52 @@ mod tests {
 
         let db = AssetDatabase::new(&tmp.0).unwrap();
         assert_eq!(db.get(key).unwrap().data(), big.as_slice());
+    }
+
+    #[test]
+    fn explicit_record_metadata_is_separate_from_payload_and_persists() {
+        let tmp = TempDir::new();
+        let metadata = AssetMetadata::new("texture", 7).unwrap();
+        let key = {
+            let mut db = AssetDatabase::new(&tmp.0).unwrap();
+            db.import_from_memory_with_metadata("image.asset", b"not decoded", metadata)
+                .unwrap()
+        };
+
+        let db = AssetDatabase::new(&tmp.0).unwrap();
+        let record = db.get_record(key).expect("record exists");
+        assert_eq!(record.path, "image.asset");
+        assert_eq!(record.asset_type, "texture");
+        assert_eq!(record.data_format_version, 7);
+        assert_eq!(db.get_data(key).unwrap().as_bytes(), b"not decoded");
+    }
+
+    #[test]
+    fn metadata_lookup_does_not_require_a_readable_payload() {
+        let tmp = TempDir::new();
+        let db_file = tmp.0.join("assets.db");
+        let mut db = AssetDatabase::new(&tmp.0).unwrap();
+        let key = db
+            .import_from_memory_with_metadata(
+                "broken.asset",
+                b"payload",
+                AssetMetadata::new("mesh", 3).unwrap(),
+            )
+            .unwrap();
+
+        // Keep the record header and metadata intact, but remove all payload
+        // bytes. Metadata lookup must still work without decoding the blob.
+        let length_without_payload = 8 + 80 + 16 + "broken.asset".len();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&db_file)
+            .unwrap();
+        file.set_len(length_without_payload as u64).unwrap();
+        drop(file);
+
+        let record = db.get_record(key).expect("metadata remains readable");
+        assert_eq!(record.asset_type, "mesh");
+        assert_eq!(record.data_format_version, 3);
+        assert!(db.get_data(key).is_none());
     }
 }

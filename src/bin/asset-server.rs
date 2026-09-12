@@ -99,9 +99,9 @@ fn run() -> Result<(), CliError> {
             reject_extra(&mut arguments)?;
             let db = open_database(&root)?;
             for key in db.keys() {
-                let asset = db.get(key).expect("indexed asset must be readable");
-                if asset.path.contains(&query) || key.to_string().contains(&query) {
-                    println!("{}\t{}", asset.key, asset.path);
+                let record = db.get_record(key).expect("indexed record must be readable");
+                if record.path.contains(&query) || key.to_string().contains(&query) {
+                    println!("{}\t{}", record.key, record.path);
                 }
             }
         }
