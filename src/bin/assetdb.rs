@@ -3,16 +3,16 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use asset_server::{AssetDatabase, AssetKey, DbError};
+use assetdb::{AssetDatabase, AssetKey, DbError};
 
 const USAGE: &str = "Usage:
-  asset-server create <root>
-  asset-server add <root> <source> [asset-path]
-  asset-server remove <root> <asset-path-or-key>
-  asset-server search <root> <query>
-  asset-server dump <root> <asset-path-or-key> <destination>
-  asset-server compact <root>
-  asset-server check <root>";
+  assetdb create <root>
+  assetdb add <root> <source> [asset-path]
+  assetdb remove <root> <asset-path-or-key>
+  assetdb search <root> <query>
+  assetdb dump <root> <asset-path-or-key> <destination>
+  assetdb compact <root>
+  assetdb check <root>";
 
 #[derive(Debug)]
 enum CliError {
@@ -177,10 +177,7 @@ fn open_database(root: &str) -> Result<AssetDatabase, CliError> {
     Ok(AssetDatabase::new(root)?)
 }
 
-fn selected_asset(
-    db: &AssetDatabase,
-    selector: &str,
-) -> Result<Option<asset_server::Asset>, CliError> {
+fn selected_asset(db: &AssetDatabase, selector: &str) -> Result<Option<assetdb::Asset>, CliError> {
     if let Ok(key) = AssetKey::from_str(selector) {
         Ok(db.get(key))
     } else {
@@ -191,7 +188,7 @@ fn selected_asset(
 fn remove_selected(
     db: &mut AssetDatabase,
     selector: &str,
-) -> Result<Option<asset_server::Asset>, CliError> {
+) -> Result<Option<assetdb::Asset>, CliError> {
     if let Ok(key) = AssetKey::from_str(selector) {
         Ok(db.remove(key)?)
     } else {

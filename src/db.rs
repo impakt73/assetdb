@@ -622,8 +622,7 @@ mod tests {
     impl TempDir {
         fn new() -> Self {
             let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let dir =
-                std::env::temp_dir().join(format!("asset-server-test-{}-{n}", std::process::id()));
+            let dir = std::env::temp_dir().join(format!("assetdb-test-{}-{n}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             TempDir(dir)
         }

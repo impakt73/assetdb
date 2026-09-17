@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "asset-server"
+name = "assetdb"
 version = "0.1.0"
 dependencies = [
  "sha256",

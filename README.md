@@ -1,4 +1,4 @@
-# asset-server
+# assetdb
 
 A simple asset database for game/server assets. Asset records are imported from
 disk or memory, identified by a stable hash key, and stored with type and data
@@ -153,7 +153,7 @@ truncation (fewer bytes on disk than recorded). I/O failures surface as
 ## Usage
 
 ```rust
-use asset_server::{AssetDatabase, AssetKey, DbError};
+use assetdb::{AssetDatabase, AssetKey, DbError};
 use std::str::FromStr;
 
 fn main() -> Result<(), DbError> {
@@ -194,19 +194,19 @@ Tests use unique per-process temp directories and clean up after themselves.
 
 ## CLI
 
-The crate also builds an `asset-server` binary. Database roots are directories;
+The crate also builds an `assetdb` binary. Database roots are directories;
 the database file is created as `<root>/assets.db`.
 
 ```sh
-asset-server create ./assets
-asset-server add ./assets models/cube.obj
-asset-server add ./assets source.bin stored/name.bin
-asset-server search ./assets cube
-asset-server dump ./assets models/cube.obj ./out/cube.obj
-asset-server dump ./assets ./out/all-assets
-asset-server remove ./assets models/cube.obj
-asset-server compact ./assets
-asset-server check ./assets
+assetdb create ./assets
+assetdb add ./assets models/cube.obj
+assetdb add ./assets source.bin stored/name.bin
+assetdb search ./assets cube
+assetdb dump ./assets models/cube.obj ./out/cube.obj
+assetdb dump ./assets ./out/all-assets
+assetdb remove ./assets models/cube.obj
+assetdb compact ./assets
+assetdb check ./assets
 ```
 
 `add` imports a source file relative to the database root. Its optional third
